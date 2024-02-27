@@ -1,68 +1,143 @@
 package mr
 
 import (
-	"fmt"
-	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
-	"regexp"
+	"path/filepath"
 	"sync"
 	"time"
 )
 
 type Map struct {
-	state    int    // 0 for idle, 1 for in-progress, 2 for completed
-	workerId []int    // worker's id if the state is not idle
-	location string // emitted file location
-	size     int    //emitted file size
-	beginTime time.Time
+	state      int    // 0 for idle, 1 for in-progress, 2 for completed
+	workerId   int    // worker's id if the state is not idle
+	location   string // emitted file location
+	size       int    // emitted file size
+	inputIndex int
+	beginTime  time.Time
 }
 type Reduce struct {
-	state    int
-	workerId int
+	state     int
+	workerId  int
+	beginTime time.Time
 }
 type Coordinator struct {
 	// Your definitions here.
-	files   []string
-	nReduce int
-	nMap    int
-	maps    []Map
-	reduces []Reduce
+	files       []string
+	nReduce     int
+	maps        []Map
+	reduces     []Reduce
 	workerCount int
-	lk sync.RWMutex
+	idLk        sync.Mutex
+	taskLk      sync.RWMutex
+	mapDone     bool
+	mapLk       sync.RWMutex
 }
 
 // Your code here -- RPC handlers for the worker to call.
-
-func (c *Coordinator) Fetch(args *WcArgs, reply *WcReply) error {
-	taskId:=-1
-	c.lk.Lock()
-	for i,m :=range(c.maps){
-		if m.state==0||(m.state==1&&time.Now().Sub(m.beginTime)>=time.Second*10){
-			taskId=i
-			break
-		}
-	}
-
-	c.maps[taskId].beginTime=time.Now()
-	c.maps[taskId].state=1
-	c.maps[taskId].workerId = append(c.maps[taskId].workerId, args.workerId)
-	c.lk.Unlock()
-
-	reply.taskType=0
-	reply.filename=
+func (c *Coordinator) GetId(args *HelloArgs, reply *HelloReply) error {
+	c.idLk.Lock()
+	c.workerCount++
+	id := c.workerCount
+	c.idLk.Unlock()
+	reply.Id = id
+	reply.NReduce = c.nReduce
 	return nil
 }
 
-func (c *Coordinator) GetId(args *IdArgs, reply *IdReply) error {
-	c.lk.Lock()
-	c.workerCount++
-	id:=c.workerCount
-	c.lk.Unlock()
-	reply.id=id
+func (c *Coordinator) Fetch(args *FetchArgs, reply *FetchReply) error {
+
+	taskIndex := -1
+	c.mapLk.RLock()
+	defer c.mapLk.RUnlock()
+	if !c.mapDone {
+		// there is still map task needs to do
+		c.taskLk.Lock()
+		defer c.taskLk.Unlock()
+		for i, m := range c.maps {
+			if m.state == 0 || (m.state == 1 && time.Now().Sub(m.beginTime) >= time.Second*10) {
+				taskIndex = i
+				break
+			}
+		}
+		// there is nothing to do
+		if taskIndex == -1 {
+			//use -1 to notice worker to wait
+			reply.TaskType = -1
+			return nil
+		}
+		task := &c.maps[taskIndex]
+		task.beginTime = time.Now()
+		task.state = 1
+		task.workerId = args.WorkerId
+
+		reply.TaskType = 0
+		reply.TaskIndex = taskIndex
+		reply.Filename = c.files[task.inputIndex]
+	} else {
+		// all map tasks are done
+		c.taskLk.Lock()
+		defer c.taskLk.Unlock()
+		for i, r := range c.reduces {
+			if r.state == 0 || (r.state == 1 && time.Now().Sub(r.beginTime) >= time.Second*10) {
+				taskIndex = i
+				break
+			}
+		}
+		if taskIndex == -1 {
+			//use -1 to notice worker to wait
+			reply.TaskType = -1
+			return nil
+		}
+		task := &c.reduces[taskIndex]
+		task.beginTime = time.Now()
+		task.state = 1
+		task.workerId = args.WorkerId
+
+		reply.TaskType = 1
+		reply.TaskIndex = taskIndex
+		reply.MapCount = len(c.maps)
+	}
+	return nil
+}
+
+func (c *Coordinator) ReportMapCompletion(args *MapReportArgs, reply *MapReportReply) error {
+	c.taskLk.Lock()
+	task := &c.maps[args.TaskIndex]
+	task.state = 2
+	task.location = args.Location
+	task.size = args.Size
+	c.taskLk.Unlock()
+	for _, m := range c.maps {
+		if m.state != 2 {
+			return nil
+		}
+	}
+	c.mapLk.Lock()
+	c.mapDone = true
+	c.mapLk.Unlock()
+	return nil
+}
+
+func (c *Coordinator) ReportReduceCompletion(args *ReduceReportArgs, reply *ReduceReportReply) error {
+	c.taskLk.Lock()
+	task := &c.reduces[args.TaskIndex]
+	task.state = 2
+	c.taskLk.Unlock()
+	return nil
+}
+
+func (c *Coordinator) SendEmittedFile(args *SendEmittedFileArgs, reply *SendEmittedFileReply) error {
+	filename := args.FileName
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		log.Fatal("can not read file")
+	}
+	reply.Content = string(content)
+
 	return nil
 }
 
@@ -92,11 +167,18 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
+	ret := true
 
 	// Your code here.
-	ret = len(c.done) == len(c.files)
-
+	for _, r := range c.reduces {
+		if r.state != 2 {
+			ret = false
+			break
+		}
+	}
+	if ret {
+		log.Println("all done!")
+	}
 	return ret
 }
 
@@ -107,32 +189,35 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Your code here.
-	entries, err := os.ReadDir(".")
-	regularFiles := []fs.DirEntry{}
-	if err != nil {
-		fmt.Println("read dir error")
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			regularFiles = append(regularFiles, e)
+	for _, p := range files {
+		inputs, err := filepath.Glob(p)
+		if err != nil {
+			panic("syntax error")
 		}
+		c.files = append(c.files, inputs...)
 	}
-	for _, e := range regularFiles {
-		for _, p := range files {
-			if m, _ := regexp.MatchString(p, e.Name()); m == true {
-				c.files = append(c.files, e.Name())
-				break
-			}
-		}
-	}
+	c.mapDone = false
 	c.nReduce = nReduce
-	c.nMap = nReduce
-	c.workerCount=0
-	index := []int{}
-	for i, _ := range files {
-		index = append(index, i)
+	c.workerCount = 0
+	// for i := 0; i < nReduce; i++ {
+	// 	c.maps = append(c.maps, Map{
+	// 		state:    0,
+	// 		workerId: -1,
+	// 	})
+	// }
+	for i, _ := range c.files {
+		c.maps = append(c.maps, Map{
+			state:      0,
+			workerId:   -1,
+			inputIndex: i,
+		})
 	}
-	
+	for i := 0; i < nReduce; i++ {
+		c.reduces = append(c.reduces, Reduce{
+			state:    0,
+			workerId: -1,
+		})
+	}
 
 	c.server()
 	return &c

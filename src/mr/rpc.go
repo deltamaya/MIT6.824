@@ -25,20 +25,47 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
-type WcArgs struct {
-	workerId int
+type FetchArgs struct {
+	WorkerId int
 }
 
-type WcReply struct {
-	filename string
-	taskType int // 0 is map, 1 is reduce
+type FetchReply struct {
+	Filename  string
+	TaskType  int // 0 is map, 1 is reduce
+	TaskIndex int
+	MapCount  int
 }
 
-type IdArgs struct {
+type HelloArgs struct {
 }
 
-type IdReply struct {
-	id int
+type HelloReply struct {
+	Id      int
+	NReduce int
+}
+
+type MapReportArgs struct {
+	TaskIndex int
+	Location  string
+	Size      int
+}
+
+type MapReportReply struct {
+}
+
+type ReduceReportArgs struct {
+	TaskIndex int
+}
+
+type ReduceReportReply struct {
+}
+
+type SendEmittedFileArgs struct {
+	FileName string
+}
+
+type SendEmittedFileReply struct {
+	Content string
 }
 
 // Cook up a unique-ish UNIX-domain socket name

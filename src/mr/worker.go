@@ -7,7 +7,11 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"strings"
+	"time"
 )
+
+var NReduce, Id int
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -26,26 +30,35 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-	id := CallGetId().id
+	reply := CallGetId()
+	Id = reply.Id
+	NReduce = reply.NReduce
+	// fmt.Printf("worker id: %d\n", Id)
 	// Your worker implementation here.
 	for {
 		task := CallFetch()
-		if task.taskType == 0 {
+		if task.TaskType == 0 {
 			kvs := MapTask(task, mapf)
-			MapEmit(id, kvs)
-		} else if task.taskType == 1 {
+			MapEmit(task.TaskIndex, kvs)
+			CallReportMapCompletion(task.TaskIndex)
+		} else if task.TaskType == 1 {
 			ReduceTask(task, reducef)
+			CallReportReduceCompletion(task.TaskIndex)
+		} else if task.TaskType == 2 {
+
 		} else {
-			panic("unknown task type")
+			// fmt.Println("going to sleep")
+			time.Sleep(10 * time.Second)
 		}
+
 	}
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
 }
 
-func MapTask(task *WcReply, mapf func(string, string) []KeyValue) []KeyValue {
-	f := task.filename
+func MapTask(task *FetchReply, mapf func(string, string) []KeyValue) []KeyValue {
+	f := task.Filename
 	content, err := os.ReadFile(f)
 	if err != nil {
 		panic("read file failed")
@@ -53,8 +66,46 @@ func MapTask(task *WcReply, mapf func(string, string) []KeyValue) []KeyValue {
 	return mapf(f, string(content))
 }
 
-func ReduceTask(task *WcReply, reducef func(string, []string) string) string {
-
+func ReduceTask(task *FetchReply, reducef func(string, []string) string) {
+	kvs := []KeyValue{}
+	for i := 0; i < task.MapCount; i++ {
+		ifname := fmt.Sprintf("mr-%d-%d.txt", i, task.TaskIndex)
+		// log.Printf("reduce file name: %s\n", ifname)
+		content := CallSendEmittedFile(ifname)
+		records := strings.Split(content, "\n")
+		var k, v string
+		for _, record := range records {
+			_, err := fmt.Sscanf(record, "%v %v", &k, &v)
+			if err != nil {
+				break
+			}
+			kvs = append(kvs, KeyValue{
+				Key:   k,
+				Value: v,
+			})
+		}
+	}
+	sort.Sort(ByKey(kvs))
+	ofname := fmt.Sprintf("mr-out-%d.txt", task.TaskIndex)
+	i := 0
+	for i < len(kvs) {
+		j := i + 1
+		for j < len(kvs) && kvs[i].Key == kvs[j].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kvs[k].Value)
+		}
+		result := reducef(kvs[i].Key, values)
+		f, err := os.OpenFile(ofname, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0777)
+		if err != nil {
+			log.Fatal("can not open reduce output file")
+		}
+		fmt.Fprintf(f, "%v %v\n", kvs[i].Key, result)
+		f.Close()
+		i = j
+	}
 }
 
 // for sorting by key.
@@ -66,21 +117,25 @@ func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 func MapEmit(id int, kvs []KeyValue) {
-	sort.Sort(ByKey(kvs))
-	ofname := fmt.Sprintf("mr-out-%d", id)
-	f, _ := os.Create(ofname)
-	i := 0
-	for i < len(kvs) {
-		j := i + 1
-		for j < len(kvs) && kvs[i].Key == kvs[j].Key {
-			j++
+	// for _,kv:=range(kvs){
+	// 	ofname:=fmt.Sprintf("mr-intermediate-%d",id)
+	// 	f,err:=os.OpenFile(ofname,os.O_CREATE|os.O_APPEND,0777)
+	// 	if err!=nil{
+	// 		panic("cant open file")
+	// 	}
+	// 	fmt.Fprintf(f,"%v %v\n",kv.Key,kv.Value)
+	// }
+
+	for _, kv := range kvs {
+		index := ihash(kv.Key) % NReduce
+		ofname := fmt.Sprintf("mr-%d-%d.txt", id, index)
+		f, err := os.OpenFile(ofname, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0777)
+		if err != nil {
+			panic("cant open file")
 		}
-		values := []string{}
-		for k := i; k < j; k++ {
-			values = append(values, kvs[k].Value)
-		}
-		fmt.Fprint(f, "%v %v\n", kvs[i].Key, values)
-		i = j
+		// fmt.Fprintf(f,"%v %v\n",kv.Key,kv.Value)
+		fmt.Fprintf(f, "%v %v\n", kv.Key, kv.Value)
+		f.Close()
 	}
 }
 
@@ -111,13 +166,12 @@ func CallExample() {
 	}
 }
 
-func CallFetch() *WcReply {
-	args := WcArgs{}
-	reply := WcReply{}
+func CallFetch() *FetchReply {
+	args := FetchArgs{}
+	reply := FetchReply{}
 	ok := call("Coordinator.Fetch", &args, &reply)
 	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("done")
+		//fmt.Println("fetch done")
 	} else {
 		fmt.Printf("call failed!\n")
 		os.Exit(0)
@@ -125,18 +179,63 @@ func CallFetch() *WcReply {
 	return &reply
 }
 
-func CallGetId() *IdReply {
-	args := IdArgs{}
-	reply := IdReply{}
+func CallGetId() *HelloReply {
+	args := HelloArgs{}
+	reply := HelloReply{}
 	ok := call("Coordinator.GetId", &args, &reply)
 	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("done")
+		// fmt.Println("get id done")
+
 	} else {
 		fmt.Printf("call failed!\n")
 		os.Exit(0)
 	}
 	return &reply
+}
+
+func CallReportMapCompletion(taskIndex int) {
+	args := MapReportArgs{
+		TaskIndex: taskIndex,
+	}
+	reply := MapReportReply{}
+	ok := call("Coordinator.ReportMapCompletion", &args, &reply)
+	if ok {
+		// fmt.Println("report map completion done")
+
+	} else {
+		fmt.Printf("call failed!\n")
+		os.Exit(0)
+	}
+}
+
+func CallReportReduceCompletion(taskIndex int) {
+	args := ReduceReportArgs{
+		TaskIndex: taskIndex,
+	}
+	reply := ReduceReportReply{}
+	ok := call("Coordinator.ReportReduceCompletion", &args, &reply)
+	if ok {
+		// fmt.Println("report reduce completion done")
+
+	} else {
+		fmt.Printf("call failed!\n")
+		os.Exit(0)
+	}
+}
+
+func CallSendEmittedFile(filename string) string {
+	args := SendEmittedFileArgs{
+		FileName: filename,
+	}
+	reply := SendEmittedFileReply{}
+	ok := call("Coordinator.SendEmittedFile", &args, &reply)
+	if ok {
+		// fmt.Println("fetch emitted file done")
+	} else {
+		fmt.Printf("call failed!\n")
+		os.Exit(0)
+	}
+	return reply.Content
 }
 
 // send an RPC request to the coordinator, wait for the response.
