@@ -53,6 +53,7 @@ func (c *Coordinator) Fetch(args *FetchArgs, reply *FetchReply) error {
 	taskIndex := -1
 	c.mapLk.RLock()
 	defer c.mapLk.RUnlock()
+
 	if !c.mapDone {
 		// there is still map task needs to do
 		c.taskLk.Lock()
@@ -130,11 +131,11 @@ func (c *Coordinator) ReportReduceCompletion(args *ReduceReportArgs, reply *Redu
 	return nil
 }
 
-func (c *Coordinator) SendEmittedFile(args *SendEmittedFileArgs, reply *SendEmittedFileReply) error {
+func (c *Coordinator) FetchEmittedFile(args *SendEmittedFileArgs, reply *SendEmittedFileReply) error {
 	filename := args.FileName
 	content, err := os.ReadFile(filename)
 	if err != nil {
-		log.Fatal("can not read file")
+		log.Fatalf("can not read file, error: %s\n", err)
 	}
 	reply.Content = string(content)
 

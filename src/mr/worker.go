@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+
 	"net/rpc"
 	"os"
 	"sort"
@@ -36,7 +37,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	// fmt.Printf("worker id: %d\n", Id)
 	// Your worker implementation here.
 	for {
-		task := CallFetch()
+		task := CallFetchTask()
 		if task.TaskType == 0 {
 			kvs := MapTask(task, mapf)
 			MapEmit(task.TaskIndex, kvs)
@@ -44,8 +45,6 @@ func Worker(mapf func(string, string) []KeyValue,
 		} else if task.TaskType == 1 {
 			ReduceTask(task, reducef)
 			CallReportReduceCompletion(task.TaskIndex)
-		} else if task.TaskType == 2 {
-
 		} else {
 			// fmt.Println("going to sleep")
 			time.Sleep(10 * time.Second)
@@ -71,7 +70,7 @@ func ReduceTask(task *FetchReply, reducef func(string, []string) string) {
 	for i := 0; i < task.MapCount; i++ {
 		ifname := fmt.Sprintf("mr-%d-%d.txt", i, task.TaskIndex)
 		// log.Printf("reduce file name: %s\n", ifname)
-		content := CallSendEmittedFile(ifname)
+		content := CallFetchEmittedFile(ifname)
 		records := strings.Split(content, "\n")
 		var k, v string
 		for _, record := range records {
@@ -117,14 +116,6 @@ func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 func MapEmit(id int, kvs []KeyValue) {
-	// for _,kv:=range(kvs){
-	// 	ofname:=fmt.Sprintf("mr-intermediate-%d",id)
-	// 	f,err:=os.OpenFile(ofname,os.O_CREATE|os.O_APPEND,0777)
-	// 	if err!=nil{
-	// 		panic("cant open file")
-	// 	}
-	// 	fmt.Fprintf(f,"%v %v\n",kv.Key,kv.Value)
-	// }
 
 	for _, kv := range kvs {
 		index := ihash(kv.Key) % NReduce
@@ -166,7 +157,7 @@ func CallExample() {
 	}
 }
 
-func CallFetch() *FetchReply {
+func CallFetchTask() *FetchReply {
 	args := FetchArgs{}
 	reply := FetchReply{}
 	ok := call("Coordinator.Fetch", &args, &reply)
@@ -223,12 +214,12 @@ func CallReportReduceCompletion(taskIndex int) {
 	}
 }
 
-func CallSendEmittedFile(filename string) string {
+func CallFetchEmittedFile(filename string) string {
 	args := SendEmittedFileArgs{
 		FileName: filename,
 	}
 	reply := SendEmittedFileReply{}
-	ok := call("Coordinator.SendEmittedFile", &args, &reply)
+	ok := call("Coordinator.FetchEmittedFile", &args, &reply)
 	if ok {
 		// fmt.Println("fetch emitted file done")
 	} else {
