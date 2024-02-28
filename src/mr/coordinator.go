@@ -135,9 +135,11 @@ func (c *Coordinator) FetchEmittedFile(args *SendEmittedFileArgs, reply *SendEmi
 	filename := args.FileName
 	content, err := os.ReadFile(filename)
 	if err != nil {
-		log.Fatalf("can not read file, error: %s\n", err)
+		log.Printf("can not read file, error: %s\n", err)
+		reply.Content = ""
+	} else {
+		reply.Content = string(content)
 	}
-	reply.Content = string(content)
 
 	return nil
 }

@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-var NReduce, Id int
+var NReduce int
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -32,7 +32,6 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 	reply := CallGetId()
-	Id = reply.Id
 	NReduce = reply.NReduce
 	// fmt.Printf("worker id: %d\n", Id)
 	// Your worker implementation here.
