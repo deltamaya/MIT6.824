@@ -1,13 +1,29 @@
 package kvsrv
 
-import "6.5840/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
 
+	"6.5840/labrpc"
+)
+
+const (
+	MaxRetries = 3
+)
 
 type Clerk struct {
 	server *labrpc.ClientEnd
 	// You will have to modify this struct.
+
+}
+
+func (c *Clerk) CallAtLeastOnce(svcMeth string, args interface{}, reply interface{}) {
+	for {
+		ok := c.server.Call(svcMeth, args, reply)
+		if ok {
+			break
+		}
+	}
 }
 
 func nrand() int64 {
@@ -37,7 +53,13 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	args := GetArgs{
+		Key: key,
+		Id:  nrand(),
+	}
+	reply := GetReply{}
+	ck.CallAtLeastOnce("KVServer.Get", &args, &reply)
+	return reply.Value
 }
 
 // shared by Put and Append.
@@ -50,7 +72,12 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	// You will have to modify this function.
-	return ""
+	args := PutAppendArgs{Key: key, Value: value, Id: nrand()}
+	reply := PutAppendReply{}
+	var ret string
+	ck.CallAtLeastOnce("KVServer."+op, &args, &reply)
+	ret = reply.Value
+	return ret
 }
 
 func (ck *Clerk) Put(key string, value string) {
