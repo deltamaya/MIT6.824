@@ -400,7 +400,7 @@ func TestMemGet2(t *testing.T) {
 	runtime.ReadMemStats(&st)
 	m := st.HeapAlloc / MiB
 	if m >= MEM {
-		t.Fatalf("error: server using too much memory %d\n", m)
+		t.Fatalf("error: server using too much memory %d\nmemory consumption: %f MiB\n", m, float64(st.HeapAlloc)/MiB)
 	}
 
 	cfg.end()

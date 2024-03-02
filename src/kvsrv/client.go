@@ -3,6 +3,7 @@ package kvsrv
 import (
 	"crypto/rand"
 	"math/big"
+	"time"
 
 	"6.5840/labrpc"
 )
@@ -14,7 +15,8 @@ const (
 type Clerk struct {
 	server *labrpc.ClientEnd
 	// You will have to modify this struct.
-
+	clientId int64
+	seq      int64
 }
 
 func (c *Clerk) CallAtLeastOnce(svcMeth string, args interface{}, reply interface{}) {
@@ -23,6 +25,7 @@ func (c *Clerk) CallAtLeastOnce(svcMeth string, args interface{}, reply interfac
 		if ok {
 			break
 		}
+		time.Sleep(time.Second * 1)
 	}
 }
 
@@ -37,6 +40,7 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.server = server
 	// You'll have to add code here.
+	ck.clientId = nrand()
 	return ck
 }
 
@@ -55,8 +59,11 @@ func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	args := GetArgs{
 		Key: key,
-		Id:  nrand(),
+		Seqence: Seq{RequestId: nrand(),
+			ClientId:      ck.clientId,
+			SeqenceNumber: ck.seq},
 	}
+	ck.seq++
 	reply := GetReply{}
 	ck.CallAtLeastOnce("KVServer.Get", &args, &reply)
 	return reply.Value
@@ -72,7 +79,8 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	// You will have to modify this function.
-	args := PutAppendArgs{Key: key, Value: value, Id: nrand()}
+	args := PutAppendArgs{Key: key, Value: value, Seqence: Seq{RequestId: nrand(), ClientId: ck.clientId, SeqenceNumber: ck.seq}}
+	ck.seq++
 	reply := PutAppendReply{}
 	var ret string
 	ck.CallAtLeastOnce("KVServer."+op, &args, &reply)
