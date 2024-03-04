@@ -171,7 +171,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.currentTerm > args.Term {
+	if rf.currentTerm >= args.Term {
 		reply.IsVoted = false
 		log.Printf("Term: %d, Client: %d Vote Against %d(EXPIRED)\n", rf.currentTerm, rf.me, args.CandidateId)
 		return
@@ -182,6 +182,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm + 1
 		rf.votedFor = rf.peers[args.CandidateId]
 		log.Printf("Term: %d, Client: %d Vote For %d\n", rf.currentTerm, rf.me, args.CandidateId)
+		time.AfterFunc(500*time.Millisecond, func() {
+			rf.mu.Lock()
+			func(term int) {
+				if term == rf.currentTerm {
+					rf.votedFor = nil
+				}
+			}(rf.currentTerm)
+			rf.mu.Unlock()
+		})
 	} else {
 		reply.IsVoted = false
 		var reason string
@@ -211,9 +220,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = nil
 		rf.isLeader = false
 	}
+	reply.Success = true
 	rf.lastHeartbeat = time.Now()
 	rf.heartbeatTimeout = randomHeartbeatTimeout()
-	log.Printf("Term: %d, Client: %d Received Heartbeat from %d\n", rf.currentTerm, rf.me, args.LeaderId)
+	// log.Printf("Term: %d, Client: %d Received Heartbeat from %d\n", rf.currentTerm, rf.me, args.LeaderId)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -243,13 +253,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, lk *sync.Mutex, voteCount *int) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	if ok && reply.IsVoted {
+		lk.Lock()
+		*voteCount++
+		lk.Unlock()
+	}
 	return ok
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if ok && reply.Success {
+		rf.mu.Lock()
+		rf.lastHeartbeat = time.Now()
+		rf.heartbeatTimeout = randomHeartbeatTimeout()
+		rf.mu.Unlock()
+	}
 	return ok
 }
 
@@ -304,35 +325,29 @@ func (rf *Raft) ticker() {
 			if time.Since(rf.lastHeartbeat) > rf.heartbeatTimeout {
 				rf.isLeader = false
 				log.Printf("Term: %d, Client: %d Leader quit\n", rf.currentTerm, rf.me)
+				rf.mu.Unlock()
+			} else {
+				rf.mu.Unlock()
+				rf.CallAppendEntries()
+
 			}
-			rf.mu.Unlock()
-			rf.CallAppendEntries()
 		} else {
 
 			// Check if a leader election should be started.
 			if time.Since(rf.lastHeartbeat) > rf.heartbeatTimeout && rf.votedFor == nil {
 				rf.mu.Unlock()
-				responses := rf.CallRequestVote()
+				voteCount := rf.CallRequestVote()
 				// rf.votedFor = rf.peers[rf.me]
-				voteCount := 1 //vote for myself
 
-				rf.mu.Lock()
-				maxTerm := rf.currentTerm
+				// rf.mu.Lock()
 				// log.Printf("Term: %d, Client: %d Request Vote Returned\n", rf.currentTerm, rf.me)
-				rf.mu.Unlock()
-				for _, r := range responses {
-					if r.IsVoted {
-						voteCount++
-						if maxTerm < r.Term {
-							maxTerm = r.Term
-						}
-					}
-				}
+				// rf.mu.Unlock()
+
 				if rf.isMajorityVote(voteCount) {
 					//I'm leader now
 					rf.mu.Lock()
 					rf.isLeader = true
-					rf.currentTerm = maxTerm
+					rf.currentTerm++
 					rf.votedFor = nil
 					log.Printf("Term: %d, Client: %d New Leader, Vote Count: %d\n", rf.currentTerm, rf.me, voteCount)
 					rf.mu.Unlock()
@@ -340,8 +355,12 @@ func (rf *Raft) ticker() {
 					rf.CallAppendEntries()
 					// go rf.BeginHeartbeat()
 				} else {
-
+					rf.mu.Lock()
+					rf.votedFor = nil
 					log.Printf("Term: %d, Client: %d Not New Leader, Vote Count: %d\n", rf.currentTerm, rf.me, voteCount)
+					rf.lastHeartbeat = time.Now()
+					rf.heartbeatTimeout = randomHeartbeatTimeout()
+					rf.mu.Unlock()
 				}
 			} else {
 				rf.mu.Unlock()
@@ -377,7 +396,7 @@ func (rf *Raft) ticker() {
 // 	rf.mu.Unlock()
 // }
 
-func (rf *Raft) CallRequestVote() []RequestVoteReply {
+func (rf *Raft) CallRequestVote() int {
 	rf.mu.Lock()
 	rf.votedFor = rf.peers[rf.me]
 	log.Printf("Term: %d, Client: %d Requesting vote\n", rf.currentTerm, rf.me)
@@ -387,6 +406,8 @@ func (rf *Raft) CallRequestVote() []RequestVoteReply {
 	}
 	rf.mu.Unlock()
 	ret := make([]RequestVoteReply, len(rf.peers))
+	var lk sync.Mutex
+	voteCount := 1
 
 	for i := range rf.peers {
 
@@ -396,40 +417,45 @@ func (rf *Raft) CallRequestVote() []RequestVoteReply {
 
 			// log.Printf("Term: %d, Client: %d Sending Vote Request to Client %d\n", rf.currentTerm, rf.me, i)
 			// rf.mu.Unlock()
-			go rf.sendRequestVote(i, &args, &ret[i])
+			go rf.sendRequestVote(i, &args, &ret[i], &lk, &voteCount)
 
 		}
 
 	}
-	time.Sleep(20 * time.Millisecond)
-	return ret
+	time.Sleep(30 * time.Millisecond)
+	lk.Lock()
+	defer lk.Unlock()
+	return voteCount
 }
 
-func (rf *Raft) CallAppendEntries() []*AppendEntriesReply {
-	responses := make([]*AppendEntriesReply, len(rf.peers)-1)
+func (rf *Raft) CallAppendEntries() []AppendEntriesReply {
+	responses := make([]AppendEntriesReply, len(rf.peers))
 	rf.mu.Lock()
 	args := AppendEntriesArgs{
 		Term:     rf.currentTerm,
 		LeaderId: rf.me,
 	}
 	rf.mu.Unlock()
-	reply := AppendEntriesReply{}
+	var lk sync.Mutex
 	for i := range rf.peers {
 		if i != rf.me {
 
-			ok := rf.sendAppendEntries(i, &args, &reply)
-			if ok {
-				responses = append(responses, &reply)
-				rf.mu.Lock()
-				rf.lastHeartbeat = time.Now()
-				rf.heartbeatTimeout = randomHeartbeatTimeout()
-				rf.mu.Unlock()
-			} else {
-				responses = append(responses, nil)
-			}
+			go rf.sendAppendEntries(i, &args, &responses[i])
+			// if ok {
+			// 	responses = append(responses, &reply)
+			// 	rf.mu.Lock()
+			// 	rf.lastHeartbeat = time.Now()
+			// 	rf.heartbeatTimeout = randomHeartbeatTimeout()
+			// 	rf.mu.Unlock()
+			// } else {
+			// 	responses = append(responses, nil)
+			// }
 		}
 
 	}
+	time.Sleep(30 * time.Millisecond)
+	lk.Lock()
+	defer lk.Unlock()
 	return responses
 }
 
