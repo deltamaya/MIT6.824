@@ -300,11 +300,11 @@ func (rf *Raft) ticker() {
 
 		// Your code here (3A)
 		rf.mu.Lock()
-		if rf.isLeader && time.Since(rf.lastHeartbeat) > rf.heartbeatTimeout {
-			rf.isLeader = false
-			log.Printf("Term: %d, Client: %d Leader quit\n", rf.currentTerm, rf.me)
-		}
 		if rf.isLeader {
+			if time.Since(rf.lastHeartbeat) > rf.heartbeatTimeout {
+				rf.isLeader = false
+				log.Printf("Term: %d, Client: %d Leader quit\n", rf.currentTerm, rf.me)
+			}
 			rf.mu.Unlock()
 			rf.CallAppendEntries()
 		} else {
