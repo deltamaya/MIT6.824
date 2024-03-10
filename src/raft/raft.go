@@ -154,10 +154,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
+	Term        int
+	CandidateId int
+	// LastLogIndex int
+	// LastLogTerm  int
+	CommitIndex int
 }
 
 // example RequestVote RPC reply structure.
@@ -212,11 +213,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		DPrintf("Term: %d, Client: %d | Voted against %d(VOTED)", rf.currentTerm, rf.me, args.CandidateId)
 		return
 	}
-	if args.Term >= rf.currentTerm && args.LastLogIndex >= rf.lastLogIndex {
+	if args.Term >= rf.currentTerm && args.CommitIndex >= rf.commitIndex {
 		reply.IsVoted = true
 		reply.Term = args.Term
 		rf.votedFor = rf.peers[args.CandidateId]
-		DPrintf("Term: %d, Client: %d | Voted for %d", rf.currentTerm, rf.me, args.CandidateId)
+		DPrintf("Term: %d, Client: %d | Voted for %d，cur commit: %d, candidate commit: %d", rf.currentTerm, rf.me, args.CandidateId, rf.commitIndex, args.CommitIndex)
 		return
 	} else {
 		reply.IsVoted = false
@@ -255,8 +256,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.log[args.PrevLogIndex+1].Term != args.Entries[0].Term {
 		rf.log[args.PrevLogIndex+1] = args.Entries[0]
 	}
+
+	reply.Success = true
+	rf.votedFor = nil
+	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+
+	rf.lastLogIndex = len(rf.log) - 1
 	var min int
-	DPrintf("Client status: %d %d", rf.lastLogIndex, rf.commitIndex)
+	DPrintf("Client status: id:%d, lastlog: %d commit: %d", rf.me, rf.lastLogIndex, rf.commitIndex)
 
 	if args.LeaderCommit > rf.commitIndex {
 		if args.LeaderCommit > args.PrevLogIndex+1 {
@@ -264,19 +271,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			min = args.LeaderCommit
 		}
-	}
-	for i := rf.commitIndex + 1; i <= min; i++ {
-		rf.applyCh <- ApplyMsg{
-			CommandValid: true,
-			Command:      rf.log[i].Command,
-			CommandIndex: i,
+		for i := rf.commitIndex + 1; i <= min; i++ {
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[i].Command,
+				CommandIndex: i,
+			}
 		}
+		rf.commitIndex = min
 	}
-	rf.commitIndex = min
-	reply.Success = true
-	rf.votedFor = nil
-	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
-	rf.lastLogIndex = len(rf.log) - 1
 
 	DPrintf("Client: %d append success, last log index: %d, len(log): %d", rf.me, rf.lastLogIndex, len(rf.log))
 
@@ -386,10 +389,11 @@ func (rf *Raft) CallRequestVote() int {
 			go func(server int) {
 				rf.mu.Lock()
 				args := RequestVoteArgs{
-					Term:         rf.currentTerm,
-					CandidateId:  rf.me,
-					LastLogIndex: rf.lastLogIndex,
-					LastLogTerm:  rf.log[rf.lastLogIndex].Term,
+					Term:        rf.currentTerm,
+					CandidateId: rf.me,
+					// LastLogIndex: rf.lastLogIndex,
+					// LastLogTerm:  rf.log[rf.lastLogIndex].Term,
+					CommitIndex: rf.commitIndex,
 				}
 				rf.mu.Unlock()
 				ok := rf.sendRequestVote(server, &args, &ret[server])
@@ -427,24 +431,22 @@ func (rf *Raft) CallAppendEntries() []AppendEntriesReply {
 
 	responses := make([]AppendEntriesReply, len(rf.peers))
 
-	DPrintf("Term: %d, Client: %d | Appending entries, last applied: %d, len(log): %d", rf.currentTerm, rf.me, rf.lastLogIndex, len(rf.log))
+	// DPrintf("Term: %d, Client: %d | Appending entries, last applied: %d, len(log): %d", rf.currentTerm, rf.me, rf.lastLogIndex, len(rf.log))
 
 	var lk sync.Mutex
 	for i := range rf.peers {
 		if i != rf.me {
-			// DPrintf("Term: %d, Client: %d | go append!!", rf.currentTerm, rf.me)
 			go func(server int) {
-				re := 0
-				for re < MAXRETRIES {
-					// DPrintf("Term: %d, Client: %d | trying to get lock!!", rf.currentTerm, rf.me)
-					rf.mu.Lock()
-					// DPrintf("Term: %d, Client: %d | got lock!!", rf.currentTerm, rf.me)
-					if rf.nextIndex[server] == 0 {
-						rf.mu.Unlock()
-						break
-					}
-					// DPrintf("creating append entry")
+				// re := 0
 
+				for {
+					rf.mu.Lock()
+					if rf.nextIndex[server] == 0 || rf.serverState != LEADER {
+						rf.mu.Unlock()
+						// break
+						return
+					}
+					DPrintf("leader %d next indices: %v", rf.me, rf.nextIndex)
 					args := AppendEntriesArgs{
 						Term:         rf.currentTerm,
 						LeaderId:     rf.me,
@@ -454,12 +456,12 @@ func (rf *Raft) CallAppendEntries() []AppendEntriesReply {
 						Entries:      rf.log[rf.nextIndex[server]:],
 					}
 					DPrintf("creating append entry done: %v", args)
-
 					rf.mu.Unlock()
 					ok := rf.sendAppendEntries(server, &args, &responses[server])
 					if !ok {
-						re++
-						continue
+						// re++
+						// continue
+						return
 					}
 					rf.resetElectionTimer()
 					rf.mu.Lock()
@@ -469,7 +471,8 @@ func (rf *Raft) CallAppendEntries() []AppendEntriesReply {
 							rf.serverState = FOLLOWER
 							rf.mu.Unlock()
 							go rf.following()
-							break
+							// break
+							return
 						}
 					}
 					if !responses[server].Success {
@@ -478,9 +481,11 @@ func (rf *Raft) CallAppendEntries() []AppendEntriesReply {
 						rf.mu.Unlock()
 					} else {
 						rf.nextIndex[server] = rf.lastLogIndex + 1
+						DPrintf("nextIndex[%d] = %d", server, rf.nextIndex[server])
 						rf.matchIndex[server] = rf.lastLogIndex
 						rf.mu.Unlock()
-						break
+						// break
+						return
 					}
 				}
 
