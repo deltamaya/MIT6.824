@@ -138,8 +138,9 @@ func TestBasicAgree3B(t *testing.T) {
 		if nd > 0 {
 			t.Fatalf("some have committed before Start()")
 		}
-
+		DPrintf("1_____________________________________")
 		xindex := cfg.one(index*100, servers, false)
+		DPrintf("2_____________________________________")
 		if xindex != index {
 			t.Fatalf("got index %v but expected %v", xindex, index)
 		}
