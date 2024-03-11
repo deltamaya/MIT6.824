@@ -501,7 +501,7 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 		cfg.mu.Unlock()
 
 		if ok {
-			DPrintf("%d thinks committed_____________________________________", i)
+			// DPrintf("%d thinks committed_____________________________________", i)
 			if count > 0 && cmd != cmd1 {
 				cfg.t.Fatalf("committed values do not match: index %v, %v, %v",
 					index, cmd, cmd1)
@@ -509,7 +509,7 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 			count += 1
 			cmd = cmd1
 		} else {
-			DPrintf("%d DONT think committed_____________________________________", i)
+			// DPrintf("%d DONT think committed_____________________________________", i)
 		}
 	}
 	return count, cmd
@@ -588,11 +588,11 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
 			t1 := time.Now()
-			DPrintf("detecting agreement_____________________________________")
+			// DPrintf("detecting agreement_____________________________________")
 
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
-				DPrintf("nd: %d_____________________________________", nd)
+				// DPrintf("nd: %d_____________________________________", nd)
 
 				if nd > 0 && nd >= expectedServers {
 					// committed
