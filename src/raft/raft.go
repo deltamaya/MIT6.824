@@ -79,7 +79,8 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	var term int
 	var isleader bool
 	// Your code here (3A).
@@ -313,23 +314,26 @@ func (rf *Raft) requestElection() {
 
 	total := len(rf.peers)
 	replies := make([]RequestVoteReply, total)
+
+	mtx := sync.Mutex{}
 	for idx := range rf.peers {
 		if idx == rf.me {
 			continue
 		}
 		args := RequestVoteArgs{CandidateID: rf.me, Term: rf.currentTerm}
 		go func(idx int) {
-			rf.sendRequestVote(idx, &args, &replies[idx])
+			ok := rf.sendRequestVote(idx, &args, &replies[idx])
+			if ok && replies[idx].VoteGranted {
+				mtx.Lock()
+				defer mtx.Unlock()
+				voteCount++
+			}
 		}(idx)
 	}
 
 	time.Sleep(100 * time.Millisecond)
-
-	for _, reply := range replies {
-		if reply.VoteGranted {
-			voteCount++
-		}
-	}
+	mtx.Lock()
+	defer mtx.Unlock()
 	log.Printf("Term %03d: Candidate %03d got %03d votes\n", rf.currentTerm, rf.me, voteCount)
 	// vote is greater than half, become leader
 	if rf.isMajority(voteCount) {
@@ -367,25 +371,28 @@ func (rf *Raft) sendHeartbeat() {
 	}
 	total := len(rf.peers)
 	replies := make([]AppednEntryReply, total)
+	reachable := 1
+	mtx := sync.Mutex{}
 	for idx := range rf.peers {
 		if idx == rf.me {
 			continue
 		}
 		go func(idx int) {
-			rf.sendAppendEntry(idx, &args, &replies[idx])
+			ok := rf.sendAppendEntry(idx, &args, &replies[idx])
+			if ok && replies[idx].Success {
+				mtx.Lock()
+				defer mtx.Unlock()
+				reachable++
+			}
 		}(idx)
 	}
 
 	time.Sleep(30 * time.Millisecond)
-	ack := 1
-	for _, reply := range replies {
-		if reply.Success {
-			ack++
-		}
-	}
+	mtx.Lock()
+	defer mtx.Unlock()
 
 	// leader has disconnected to most peers
-	if !rf.isMajority(ack) {
+	if !rf.isMajority(reachable) {
 		log.Printf("Term %03d: Leader %03d didn't receive enough heartbeats\n", rf.currentTerm, rf.me)
 		rf.leaderToFollower()
 	}
