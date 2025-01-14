@@ -328,6 +328,7 @@ func (rf *Raft) resetSyncTimeTrigger() {
 }
 
 func (rf *Raft) applyCommitedLogs() {
+	DPrintf("Applying log in Peer %03d with log %v\n", rf.me, rf.log)
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		msg := ApplyMsg{
 			CommandValid: true,
@@ -526,8 +527,14 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *Append
 	timeout := time.NewTimer(30 * time.Millisecond)
 	defer timeout.Stop()
 	ret := make(chan struct{}, 1)
+	stopCh := make(chan struct{}, 1)
 	go func() {
 		for i := 0; i < 10; i++ {
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
 			ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
 			if ok {
 				ret <- struct{}{}
@@ -540,6 +547,7 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *Append
 		return true
 	case <-timeout.C:
 		DPrintf("Term %03d Peer %03d Append Entry to %03d timeout\n", args.Term, rf.me, server)
+		stopCh <- struct{}{}
 		return false
 	}
 }
@@ -547,6 +555,7 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *Append
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	switch rf.identity {
 	case FOLLOWER:
 	case CANDIDATE:
@@ -580,7 +589,6 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.NextLogIndex = lastLogIndex + 1
 		DPrintf("Term %03d Peer %03d refuse ae log gap, prev index: %d, last: %d,next: %03d\n", rf.currentTerm, rf.me, args.PrevLogIndex, lastLogIndex, reply.NextLogIndex)
 		DPrintf("Term %03d Peer %03d log: %v args: %v\n", rf.currentTerm, rf.me, rf.log, args.Entries)
-
 		return
 	}
 
@@ -592,8 +600,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			index--
 		}
 		reply.NextLogIndex = index + 1
-		DPrintf("Term %03d Peer %03d refuse ae for term mismatch(%d!=%d), next: %03d\n", rf.currentTerm, rf.me, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, reply.NextLogIndex)
-		DPrintf("Term %03d Peer %03d logs: %v args: %v\n", rf.currentTerm, rf.me, rf.log, args.Entries)
+		// DPrintf("Term %03d Peer %03d refuse ae for term mismatch(%d!=%d), next: %03d\n", rf.currentTerm, rf.me, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, reply.NextLogIndex)
+		// DPrintf("Term %03d Peer %03d logs: %v args: %v\n", rf.currentTerm, rf.me, rf.log, args.Entries)
 		return
 	}
 
@@ -604,25 +612,28 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		} else {
 			idx = args.LeaderCommit
 		}
-		if idx != rf.commitIndex {
-			rf.commitIndex = idx
-			rf.notifyApplyCh <- struct{}{}
-			DPrintf("Term %03d Follower %03d update commit to %03d\n", rf.currentTerm, rf.me, rf.commitIndex)
-		}
+		rf.commitIndex = idx
+		rf.notifyApplyCh <- struct{}{}
+		// DPrintf("Term %03d Follower %03d update commit to %03d\n", rf.currentTerm, rf.me, idx)
 	}
 
-	// return if this is a heartbeat call
 	if len(args.Entries) == 0 {
 		reply.Success = true
 		return
 	}
 
 	// matched, replicate logs
+	lastLogTerm := rf.log[lastLogIndex].Term
+	if lastLogTerm == args.Term && len(rf.log) > args.PrevLogIndex+1+len(args.Entries) {
+		reply.Success = true
+		reply.NextLogIndex = len(rf.log)
+		return
+	}
 	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 	reply.Success = true
 	reply.NextLogIndex = len(rf.log)
 	DPrintf("Term %03d Peer %03d accepted ae, next: %03d\n", rf.currentTerm, rf.me, reply.NextLogIndex)
-
+	DPrintf("Term %03d Peer %03d logs: %v args: %v\n", rf.currentTerm, rf.me, rf.log, args.Entries)
 }
 
 // the service or tester wants to create a Raft server. the ports
