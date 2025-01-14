@@ -167,7 +167,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Reply false if term <= currentTerm
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.Term <= rf.currentTerm {
+	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 		DPrintf("Term %03d: Peer %03d against Peer %03d, low candidate term %03d\n", rf.currentTerm, rf.me, args.CandidateID, args.Term)
@@ -177,7 +177,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = -1
 		rf.currentTerm = args.Term
 	}
-
+	// args.Term == rf.currentTerm
 	lastLogIndex := len(rf.log) - 1
 	lastLogTerm := rf.log[lastLogIndex].Term
 	if lastLogTerm > args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
@@ -423,12 +423,12 @@ func (rf *Raft) syncEntries() {
 	DPrintf("Term %03d: Peer %03d syncing entires\n", rf.currentTerm, rf.me)
 	reachable := 1
 	mtx := sync.Mutex{}
+	DPrintf("Leader log: %v\n", rf.log)
 	for idx := range rf.peers {
 		if idx == rf.me {
 			continue
 		}
 		prevLogIndex, prevLogTerm, logs := rf.getAppendEntries(idx)
-
 		args := AppendEntryArgs{
 			Term:         rf.currentTerm,
 			LeaderID:     rf.me,
@@ -550,9 +550,14 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	switch rf.identity {
 	case FOLLOWER:
 	case CANDIDATE:
-		rf.identity = FOLLOWER
+		if args.Term >= rf.currentTerm {
+			rf.identity = FOLLOWER
+		}
 	case LEADER:
-		rf.leaderToFollower()
+		if args.Term >= rf.currentTerm {
+			DPrintf("Term %03d Leader %03d got AE from Peer %03d, term: %03d\n", rf.currentTerm, rf.me, args.LeaderID, args.Term)
+			rf.leaderToFollower()
+		}
 	}
 
 	// if this is an outdated call
@@ -561,13 +566,12 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.Term = rf.currentTerm
 		return
 	}
+	if rf.currentTerm < args.Term {
+		rf.currentTerm = args.Term
+	}
 	rf.electionTimer = time.NewTimer(randomElectionTimeout())
 
-	rf.currentTerm = args.Term
-	rf.votedFor = -1
-
 	lastLogIndex := len(rf.log) - 1
-	lastLogTerm := rf.log[lastLogIndex].Term
 
 	// has log gap
 	if args.PrevLogIndex > lastLogIndex {
@@ -581,14 +585,14 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 
 	// term mismatch
-	if lastLogIndex != 0 && lastLogTerm != args.PrevLogTerm {
+	if lastLogIndex != 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		index := args.PrevLogIndex
-		for index > rf.commitIndex && rf.log[index].Term != args.PrevLogTerm {
+		for index > rf.commitIndex && rf.log[index].Term == rf.log[args.PrevLogIndex].Term {
 			index--
 		}
 		reply.NextLogIndex = index + 1
-		DPrintf("Term %03d Peer %03d refuse ae for term mismatch(%d!=%d), next: %03d\n", rf.currentTerm, rf.me, lastLogTerm, args.PrevLogTerm, reply.NextLogIndex)
+		DPrintf("Term %03d Peer %03d refuse ae for term mismatch(%d!=%d), next: %03d\n", rf.currentTerm, rf.me, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, reply.NextLogIndex)
 		DPrintf("Term %03d Peer %03d logs: %v args: %v\n", rf.currentTerm, rf.me, rf.log, args.Entries)
 		return
 	}
