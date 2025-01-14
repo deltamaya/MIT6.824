@@ -347,7 +347,6 @@ func (rf *Raft) requestElection() {
 	rf.identity = CANDIDATE
 
 	rf.currentTerm++
-	rf.electionTimer = time.NewTimer(randomElectionTimeout())
 	DPrintf("Term %03d: Candidate %03d requesting election.\n", rf.currentTerm, rf.me)
 
 	total := len(rf.peers)
@@ -383,6 +382,8 @@ func (rf *Raft) requestElection() {
 		rf.candidateToLeader()
 		rf.syncEntries()
 	}
+	rf.electionTimer = time.NewTimer(randomElectionTimeout())
+
 }
 
 type LogEntry struct {

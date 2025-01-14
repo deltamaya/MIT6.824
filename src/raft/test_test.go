@@ -338,6 +338,8 @@ func TestFailNoAgree3B(t *testing.T) {
 		t.Fatalf("%v committed but no majority", n)
 	}
 
+	DPrintf("Connect: %d %d %d\n", (leader+1)%servers, (leader+2)%servers, (leader+3)%servers)
+
 	// repair
 	cfg.connect((leader + 1) % servers)
 	cfg.connect((leader + 2) % servers)
