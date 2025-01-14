@@ -68,18 +68,19 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	currentTerm     int
-	votedFor        int
-	electionTimer   *time.Timer
-	heartbeatTicker *time.Ticker
-	identity        int
-	log             []LogEntry
-	commitIndex     int
-	lastApplied     int
-	nextIndex       []int
-	matchIndex      []int
-	applyCh         chan ApplyMsg
-	notifyApplyCh   chan struct{}
+	currentTerm      int
+	votedFor         int
+	electionTimer    *time.Timer
+	syncEntriesTimer *time.Timer
+	identity         int
+	log              []LogEntry
+	commitIndex      int
+	lastApplied      int
+	nextIndex        []int
+	matchIndex       []int
+	applyCh          chan ApplyMsg
+	notifyApplyCh    chan struct{}
+	syncEntriesCh    chan struct{}
 }
 
 // return currentTerm and whether this server
@@ -175,10 +176,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.votedFor = -1
 		rf.currentTerm = args.Term
-		if rf.identity == LEADER {
-			rf.heartbeatTicker = nil
-			rf.identity = FOLLOWER
-		}
 	}
 
 	lastLogIndex := len(rf.log) - 1
@@ -194,6 +191,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateID {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
+		if rf.identity == LEADER {
+			rf.syncEntriesTimer = nil
+			rf.identity = FOLLOWER
+		}
 		rf.electionTimer = time.NewTimer(randomElectionTimeout())
 		DPrintf("Term %03d: Peer %03d voted for Peer %03d\n", rf.currentTerm, rf.me, rf.votedFor)
 		return
@@ -271,7 +272,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	})
 
-	go rf.syncEntries()
 	return index, term, isLeader
 }
 
@@ -297,16 +297,17 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		// Your code here (3A)
 		if rf.identity == LEADER {
 			select {
-			case <-rf.heartbeatTicker.C:
-				rf.sendHeartbeat()
+			case <-rf.syncEntriesTimer.C:
+				rf.resetSyncTimeTrigger()
 			default:
 			}
 		}
-
+		// Your code here (3A)
 		select {
+		case <-rf.syncEntriesCh:
+			rf.syncEntries()
 		case <-rf.electionTimer.C:
 			rf.requestElection()
 		case <-rf.notifyApplyCh:
@@ -316,6 +317,14 @@ func (rf *Raft) ticker() {
 		rf.mu.Unlock()
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func (rf *Raft) resetSyncTime() {
+	rf.syncEntriesTimer = time.NewTimer(50 * time.Millisecond)
+}
+func (rf *Raft) resetSyncTimeTrigger() {
+	rf.syncEntriesCh <- struct{}{}
+	rf.syncEntriesTimer = time.NewTimer(50 * time.Millisecond)
 }
 
 func (rf *Raft) applyCommitedLogs() {
@@ -407,119 +416,94 @@ func (rf *Raft) getAppendEntries(peerID int) (int, int, []LogEntry) {
 }
 
 func (rf *Raft) syncEntries() {
-	DPrintf("Term %03d: Peer %03d syncing entires\n", rf.currentTerm, rf.me)
-
-	for idx := range rf.peers {
-		if idx == rf.me {
-			continue
-		}
-		go rf.syncEntriesSingle(idx)
-	}
-
-	time.Sleep(30 * time.Millisecond)
-
-}
-
-func (rf *Raft) syncEntriesSingle(peerID int) {
-	rf.mu.Lock()
-	prevLogIndex, prevLogTerm, logs := rf.getAppendEntries(peerID)
-
-	args := AppendEntryArgs{
-		Term:         rf.currentTerm,
-		LeaderID:     rf.me,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  prevLogTerm,
-		Entries:      logs,
-		LeaderCommit: rf.commitIndex,
-	}
-	rf.mu.Unlock()
-
-	reply := AppendEntryReply{}
-	DPrintf("Term %03d Leader %03d ae logs: %v\n", rf.currentTerm, rf.me, args.Entries)
-	rf.sendAppendEntry(peerID, &args, &reply)
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if reply.Success {
-		if reply.NextLogIndex > rf.nextIndex[peerID] {
-			rf.nextIndex[peerID] = reply.NextLogIndex
-			rf.matchIndex[peerID] = reply.NextLogIndex - 1
-		}
-		hasCommit := false
-		for i := rf.commitIndex + 1; i <= rf.matchIndex[peerID]; i++ {
-			count := 1
-			for j := 0; j < len(rf.peers); j++ {
-				if i >= rf.matchIndex[j] {
-					count++
-				}
-			}
-			if rf.isMajority(count) {
-				rf.commitIndex = i
-				hasCommit = true
-			}
-		}
-		if hasCommit {
-			DPrintf("Term %03d Leader %03d update commit index -> %d\n", rf.currentTerm, rf.me, rf.commitIndex)
-			rf.notifyApplyCh <- struct{}{}
-		}
+	if rf.identity != LEADER {
 		return
 	}
-	if reply.NextLogIndex != 0 {
-		rf.nextIndex[peerID] = reply.NextLogIndex
-	}
-
-}
-
-func (rf *Raft) sendHeartbeat() {
-	rf.electionTimer = time.NewTimer(randomElectionTimeout())
-	DPrintf("Term %03d: Peer %03d sending heartbeats\n", rf.currentTerm, rf.me)
-	args := AppendEntryArgs{
-		Term:         rf.currentTerm,
-		LeaderID:     rf.me,
-		Entries:      nil,
-		LeaderCommit: rf.commitIndex,
-	}
-	total := len(rf.peers)
-	replies := make([]AppendEntryReply, total)
+	DPrintf("Term %03d: Peer %03d syncing entires\n", rf.currentTerm, rf.me)
 	reachable := 1
 	mtx := sync.Mutex{}
 	for idx := range rf.peers {
 		if idx == rf.me {
 			continue
 		}
+		prevLogIndex, prevLogTerm, logs := rf.getAppendEntries(idx)
+
+		args := AppendEntryArgs{
+			Term:         rf.currentTerm,
+			LeaderID:     rf.me,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      logs,
+			LeaderCommit: rf.commitIndex,
+		}
+		reply := AppendEntryReply{}
 		go func(idx int) {
-			ok := rf.sendAppendEntry(idx, &args, &replies[idx])
-			if ok && replies[idx].Success {
+			ok := rf.syncEntriesSingle(idx, &args, &reply)
+			if ok {
 				mtx.Lock()
 				defer mtx.Unlock()
 				reachable++
+
+				if reply.Success {
+					if reply.NextLogIndex > rf.nextIndex[idx] {
+						rf.nextIndex[idx] = reply.NextLogIndex
+						rf.matchIndex[idx] = reply.NextLogIndex - 1
+					}
+					hasCommit := false
+					for i := rf.commitIndex + 1; i <= rf.matchIndex[idx]; i++ {
+						count := 1
+						for j := 0; j < len(rf.peers); j++ {
+							if i <= rf.matchIndex[j] {
+								count++
+							}
+						}
+						if rf.isMajority(count) {
+							rf.commitIndex = i
+							hasCommit = true
+						}
+					}
+					if hasCommit {
+						DPrintf("Term %03d Leader %03d update commit index -> %d\n", rf.currentTerm, rf.me, rf.commitIndex)
+						rf.notifyApplyCh <- struct{}{}
+					}
+				}
+				if reply.NextLogIndex != 0 {
+					rf.nextIndex[idx] = reply.NextLogIndex
+				}
 			}
 		}(idx)
 	}
-
 	time.Sleep(30 * time.Millisecond)
 	mtx.Lock()
 	defer mtx.Unlock()
 
-	// leader has disconnected to most peers
+	rf.electionTimer = time.NewTimer(randomElectionTimeout())
+
 	if !rf.isMajority(reachable) {
-		DPrintf("Term %03d: Leader %03d didn't receive enough heartbeats\n", rf.currentTerm, rf.me)
+		DPrintf("Term %03d: Leader %03d didn't receive enough heartbeats: %d\n", rf.currentTerm, rf.me, reachable)
 		rf.leaderToFollower()
 		return
 	}
+	rf.syncEntriesTimer = time.NewTimer(50 * time.Millisecond)
+}
+
+func (rf *Raft) syncEntriesSingle(peerID int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
+	// DPrintf("Term %03d Leader %03d ae logs: %v\n", rf.currentTerm, rf.me, args.Entries)
+	ok := rf.sendAppendEntry(peerID, args, reply)
+	return ok
 }
 
 func (rf *Raft) leaderToFollower() {
 	DPrintf("Term %03d: Leader %03d became Follower\n", rf.currentTerm, rf.me)
 	rf.identity = FOLLOWER
-	rf.heartbeatTicker = nil
+	rf.syncEntriesTimer = nil
 	rf.electionTimer = time.NewTimer(randomElectionTimeout())
 }
 func (rf *Raft) candidateToLeader() {
 	DPrintf("Term %03d: Candidate %03d became Leader\n", rf.currentTerm, rf.me)
 	rf.identity = LEADER
 	rf.electionTimer = time.NewTimer(randomElectionTimeout())
-	rf.heartbeatTicker = time.NewTicker(50 * time.Millisecond)
+	rf.syncEntriesTimer = time.NewTimer(50 * time.Millisecond)
 	count := len(rf.peers)
 	rf.nextIndex = make([]int, count)
 	lastLogIndex := len(rf.log) - 1
@@ -530,6 +514,7 @@ func (rf *Raft) candidateToLeader() {
 	for i := 0; i < count; i++ {
 		rf.matchIndex[i] = 0
 	}
+
 }
 
 func (rf *Raft) isMajority(n int) bool {
@@ -583,24 +568,14 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	lastLogIndex := len(rf.log) - 1
 	lastLogTerm := rf.log[lastLogIndex].Term
 
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = args.LeaderCommit
-		rf.notifyApplyCh <- struct{}{}
-		DPrintf("Term %03d Follower %03d update commit to %03d\n", rf.currentTerm, rf.me, rf.commitIndex)
-	}
-
-	// return if this is a heartbeat call
-	if args.Entries == nil {
-		reply.Success = true
-		return
-	}
-
 	// has log gap
-	if args.PrevLogIndex >= len(rf.log) {
+	if args.PrevLogIndex > lastLogIndex {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		reply.NextLogIndex = lastLogIndex + 1
-		DPrintf("Term %03d Peer %03d refuse ae log gap, next: %03d\n", rf.currentTerm, rf.me, reply.NextLogIndex)
+		DPrintf("Term %03d Peer %03d refuse ae log gap, prev index: %d, last: %d,next: %03d\n", rf.currentTerm, rf.me, args.PrevLogIndex, lastLogIndex, reply.NextLogIndex)
+		DPrintf("Term %03d Peer %03d log: %v args: %v\n", rf.currentTerm, rf.me, rf.log, args.Entries)
+
 		return
 	}
 
@@ -612,7 +587,28 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			index--
 		}
 		reply.NextLogIndex = index + 1
-		DPrintf("Term %03d Peer %03d refuse ae for term mismatch, next: %03d\n", rf.currentTerm, rf.me, reply.NextLogIndex)
+		DPrintf("Term %03d Peer %03d refuse ae for term mismatch(%d!=%d), next: %03d\n", rf.currentTerm, rf.me, lastLogTerm, args.PrevLogTerm, reply.NextLogIndex)
+		DPrintf("Term %03d Peer %03d logs: %v args: %v\n", rf.currentTerm, rf.me, rf.log, args.Entries)
+		return
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		idx := 0
+		if lastLogIndex < args.LeaderCommit {
+			idx = lastLogIndex
+		} else {
+			idx = args.LeaderCommit
+		}
+		if idx != rf.commitIndex {
+			rf.commitIndex = idx
+			rf.notifyApplyCh <- struct{}{}
+			DPrintf("Term %03d Follower %03d update commit to %03d\n", rf.currentTerm, rf.me, rf.commitIndex)
+		}
+	}
+
+	// return if this is a heartbeat call
+	if len(args.Entries) == 0 {
+		reply.Success = true
 		return
 	}
 
@@ -645,12 +641,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.electionTimer = time.NewTimer(randomElectionTimeout())
 	rf.identity = FOLLOWER
-	rf.heartbeatTicker = nil
+	rf.syncEntriesTimer = nil
 	rf.applyCh = applyCh
 	rf.log = []LogEntry{
 		{},
 	}
 	rf.notifyApplyCh = make(chan struct{}, 10)
+	rf.syncEntriesCh = make(chan struct{}, 10)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
