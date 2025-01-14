@@ -521,7 +521,7 @@ func TestBackup3B(t *testing.T) {
 	DPrintf("Disconnect: %d %d %d\n", (leader1+2)%servers, (leader1+3)%servers, (leader1+4)%servers)
 
 	// submit lots of commands that won't commit
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 50; i++ {
 		cfg.rafts[leader1].Start(rand.Int())
 	}
 
@@ -538,7 +538,7 @@ func TestBackup3B(t *testing.T) {
 	DPrintf("Connect: %d %d %d\n", (leader1+2)%servers, (leader1+3)%servers, (leader1+4)%servers)
 
 	// lots of successful commands to new group.
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
 
@@ -569,7 +569,7 @@ func TestBackup3B(t *testing.T) {
 	DPrintf("Connect: %d %d %d\n", (leader1+0)%servers, (leader1+1)%servers, other)
 
 	// lots of successful commands to new group.
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
 
