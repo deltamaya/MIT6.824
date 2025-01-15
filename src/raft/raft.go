@@ -20,12 +20,14 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -112,6 +114,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	state := w.Bytes()
+	rf.persister.Save(state, nil)
 }
 
 // restore previously persisted state.
@@ -132,6 +142,21 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		DPrintf("Unable to decode\n")
+		return
+	}
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.log = log
+
 }
 
 // the service says it has created a snapshot that has
@@ -167,6 +192,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Reply false if term <= currentTerm
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
@@ -346,7 +372,7 @@ func (rf *Raft) requestElection() {
 	voteCount := 1
 	rf.votedFor = rf.me
 	rf.identity = CANDIDATE
-
+	defer rf.persist()
 	rf.currentTerm++
 	DPrintf("Term %03d: Candidate %03d requesting election.\n", rf.currentTerm, rf.me)
 
@@ -418,9 +444,12 @@ func (rf *Raft) getAppendEntries(peerID int) (int, int, []LogEntry) {
 }
 
 func (rf *Raft) syncEntries() {
+
 	if rf.identity != LEADER {
 		return
 	}
+	defer rf.persist()
+
 	DPrintf("Term %03d: Peer %03d syncing entires\n", rf.currentTerm, rf.me)
 	reachable := 1
 	mtx := sync.Mutex{}
@@ -555,7 +584,7 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *Append
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
+	defer rf.persist()
 	switch rf.identity {
 	case FOLLOWER:
 	case CANDIDATE:
