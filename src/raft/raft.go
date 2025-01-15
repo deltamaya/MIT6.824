@@ -37,6 +37,14 @@ const (
 	LEADER    = 3
 )
 
+const (
+	RPCTimeout        = 30 * time.Millisecond
+	HeartbeatInterval = 150 * time.Millisecond
+	ElectionTimeout   = 300 * time.Millisecond
+	ApplyInterval     = 100 * time.Millisecond
+	TickInterval      = 10 * time.Millisecond
+)
+
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -83,6 +91,7 @@ type Raft struct {
 	applyCh          chan ApplyMsg
 	notifyApplyCh    chan struct{}
 	syncEntriesCh    chan struct{}
+	appendEntryRetry int
 }
 
 // return currentTerm and whether this server
@@ -190,8 +199,12 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	// Reply false if term <= currentTerm
+	if rf.killed() {
+		return
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	rf.persist()
 	defer rf.persist()
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
@@ -259,8 +272,35 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+	timeout := time.NewTimer(RPCTimeout)
+	defer timeout.Stop()
+	ret := make(chan struct{}, 1)
+	stopCh := make(chan struct{}, 1)
+	go func() {
+		for i := 0; i < 10; i++ {
+			if rf.killed() {
+				return
+			}
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+			ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+			if ok {
+				ret <- struct{}{}
+				break
+			}
+		}
+	}()
+	select {
+	case <-ret:
+		return true
+	case <-timeout.C:
+		DPrintf("Term %03d Peer %03d Requset Vote to %03d timeout\n", args.Term, rf.me, server)
+		stopCh <- struct{}{}
+		return false
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -341,16 +381,13 @@ func (rf *Raft) ticker() {
 		default:
 		}
 		rf.mu.Unlock()
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(TickInterval)
 	}
 }
 
-func (rf *Raft) resetSyncTime() {
-	rf.syncEntriesTimer = time.NewTimer(50 * time.Millisecond)
-}
 func (rf *Raft) resetSyncTimeTrigger() {
 	rf.syncEntriesCh <- struct{}{}
-	rf.syncEntriesTimer = time.NewTimer(50 * time.Millisecond)
+	rf.syncEntriesTimer = time.NewTimer(HeartbeatInterval)
 }
 
 func (rf *Raft) applyCommitedLogs() {
@@ -367,13 +404,16 @@ func (rf *Raft) applyCommitedLogs() {
 }
 
 func (rf *Raft) requestElection() {
-
+	if rf.killed() {
+		return
+	}
 	// vote for myself by default
 	voteCount := 1
 	rf.votedFor = rf.me
 	rf.identity = CANDIDATE
-	defer rf.persist()
 	rf.currentTerm++
+	rf.persist()
+	defer rf.persist()
 	DPrintf("Term %03d: Candidate %03d requesting election.\n", rf.currentTerm, rf.me)
 
 	total := len(rf.peers)
@@ -400,7 +440,10 @@ func (rf *Raft) requestElection() {
 		}(idx)
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(RPCTimeout)
+	if rf.killed() {
+		return
+	}
 	mtx.Lock()
 	defer mtx.Unlock()
 	DPrintf("Term %03d: Candidate %03d got %03d votes\n", rf.currentTerm, rf.me, voteCount)
@@ -444,10 +487,13 @@ func (rf *Raft) getAppendEntries(peerID int) (int, int, []LogEntry) {
 }
 
 func (rf *Raft) syncEntries() {
-
+	if rf.killed() {
+		return
+	}
 	if rf.identity != LEADER {
 		return
 	}
+	rf.persist()
 	defer rf.persist()
 
 	DPrintf("Term %03d: Peer %03d syncing entires\n", rf.currentTerm, rf.me)
@@ -469,17 +515,20 @@ func (rf *Raft) syncEntries() {
 		}
 		reply := AppendEntryReply{}
 		go func(idx int) {
-			ok := rf.syncEntriesSingle(idx, &args, &reply)
-			if ok {
-				mtx.Lock()
-				defer mtx.Unlock()
-				reachable++
+			ok := rf.sendAppendEntry(idx, &args, &reply)
+			if !ok {
+				return
+			}
+			mtx.Lock()
+			defer mtx.Unlock()
+			reachable++
 
-				if reply.Success {
-					if reply.NextLogIndex > rf.nextIndex[idx] {
-						rf.nextIndex[idx] = reply.NextLogIndex
-						rf.matchIndex[idx] = reply.NextLogIndex - 1
-					}
+			if reply.Success {
+				if reply.NextLogIndex > rf.nextIndex[idx] {
+					rf.nextIndex[idx] = reply.NextLogIndex
+					rf.matchIndex[idx] = reply.NextLogIndex - 1
+				}
+				if len(args.Entries) > 0 && args.Entries[len(args.Entries)-1].Term == rf.currentTerm {
 					hasCommit := false
 					for i := rf.commitIndex + 1; i <= rf.matchIndex[idx]; i++ {
 						count := 1
@@ -498,30 +547,34 @@ func (rf *Raft) syncEntries() {
 						rf.notifyApplyCh <- struct{}{}
 					}
 				}
-				if reply.NextLogIndex != 0 {
-					rf.nextIndex[idx] = reply.NextLogIndex
-				}
 			}
+			if reply.NextLogIndex != 0 {
+				rf.nextIndex[idx] = reply.NextLogIndex
+			}
+			rf.persist()
 		}(idx)
 	}
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	if rf.killed() {
+		return
+	}
 	mtx.Lock()
 	defer mtx.Unlock()
 
 	rf.electionTimer = time.NewTimer(randomElectionTimeout())
 
 	if !rf.isMajority(reachable) {
+		if rf.appendEntryRetry < 3 {
+			rf.appendEntryRetry++
+			rf.resetSyncTimeTrigger()
+			return
+		}
 		DPrintf("Term %03d: Leader %03d didn't receive enough heartbeats: %d\n", rf.currentTerm, rf.me, reachable)
 		rf.leaderToFollower()
 		return
 	}
-	rf.syncEntriesTimer = time.NewTimer(50 * time.Millisecond)
-}
-
-func (rf *Raft) syncEntriesSingle(peerID int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
-	// DPrintf("Term %03d Leader %03d ae logs: %v\n", rf.currentTerm, rf.me, args.Entries)
-	ok := rf.sendAppendEntry(peerID, args, reply)
-	return ok
+	rf.appendEntryRetry = 0
+	rf.syncEntriesTimer = time.NewTimer(HeartbeatInterval)
 }
 
 func (rf *Raft) leaderToFollower() {
@@ -534,7 +587,7 @@ func (rf *Raft) candidateToLeader() {
 	DPrintf("Term %03d: Candidate %03d became Leader\n", rf.currentTerm, rf.me)
 	rf.identity = LEADER
 	rf.electionTimer = time.NewTimer(randomElectionTimeout())
-	rf.syncEntriesTimer = time.NewTimer(50 * time.Millisecond)
+	rf.syncEntriesTimer = time.NewTimer(HeartbeatInterval)
 	count := len(rf.peers)
 	rf.nextIndex = make([]int, count)
 	lastLogIndex := len(rf.log) - 1
@@ -553,12 +606,15 @@ func (rf *Raft) isMajority(n int) bool {
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
-	timeout := time.NewTimer(30 * time.Millisecond)
+	timeout := time.NewTimer(3 * RPCTimeout)
 	defer timeout.Stop()
 	ret := make(chan struct{}, 1)
 	stopCh := make(chan struct{}, 1)
 	go func() {
-		for i := 0; i < 10; i++ {
+		for i := 0; i < 3; i++ {
+			if rf.killed() {
+				return
+			}
 			select {
 			case <-stopCh:
 				return
@@ -582,8 +638,12 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *Append
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
+	if rf.killed() {
+		return
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	rf.persist()
 	defer rf.persist()
 	switch rf.identity {
 	case FOLLOWER:
@@ -592,7 +652,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			rf.identity = FOLLOWER
 		}
 	case LEADER:
-		if args.Term >= rf.currentTerm {
+		if args.Term > rf.currentTerm {
 			DPrintf("Term %03d Leader %03d got AE from Peer %03d, term: %03d\n", rf.currentTerm, rf.me, args.LeaderID, args.Term)
 			rf.leaderToFollower()
 		}
@@ -629,8 +689,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			index--
 		}
 		reply.NextLogIndex = index + 1
-		// DPrintf("Term %03d Peer %03d refuse ae for term mismatch(%d!=%d), next: %03d\n", rf.currentTerm, rf.me, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, reply.NextLogIndex)
-		// DPrintf("Term %03d Peer %03d logs: %v args: %v\n", rf.currentTerm, rf.me, rf.log, args.Entries)
+		DPrintf("Term %03d Peer %03d refuse ae for term mismatch(%d!=%d), next: %03d\n", rf.currentTerm, rf.me, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, reply.NextLogIndex)
+		DPrintf("Term %03d Peer %03d logs: %v args: %v\n", rf.currentTerm, rf.me, rf.log, args.Entries)
 		return
 	}
 
@@ -643,7 +703,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		}
 		rf.commitIndex = idx
 		rf.notifyApplyCh <- struct{}{}
-		// DPrintf("Term %03d Follower %03d update commit to %03d\n", rf.currentTerm, rf.me, idx)
+		DPrintf("Term %03d Follower %03d update commit to %03d\n", rf.currentTerm, rf.me, idx)
 	}
 
 	if len(args.Entries) == 0 {
@@ -703,6 +763,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func randomElectionTimeout() time.Duration {
-	amount := (rand.Int63() % 150) + 150
+	amount := (rand.Int63() % 300) + 300
 	return time.Duration(amount) * time.Millisecond
 }

@@ -929,7 +929,9 @@ func TestFigure8Unreliable3C(t *testing.T) {
 
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
+		DPrintf("iter %d\n", iters)
 		if iters == 200 {
+			DPrintf("Start Long Reordering\n")
 			cfg.setlongreordering(true)
 		}
 		leader := -1
@@ -947,8 +949,8 @@ func TestFigure8Unreliable3C(t *testing.T) {
 			ms := (rand.Int63() % 13)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
-
 		if leader != -1 && (rand.Int()%1000) < int(RaftElectionTimeout/time.Millisecond)/2 {
+			DPrintf("Disconnect %d\n", leader)
 			cfg.disconnect(leader)
 			nup -= 1
 		}
@@ -956,6 +958,7 @@ func TestFigure8Unreliable3C(t *testing.T) {
 		if nup < 3 {
 			s := rand.Int() % servers
 			if cfg.connected[s] == false {
+				DPrintf("Connect %d\n", s)
 				cfg.connect(s)
 				nup += 1
 			}
@@ -964,11 +967,12 @@ func TestFigure8Unreliable3C(t *testing.T) {
 
 	for i := 0; i < servers; i++ {
 		if cfg.connected[i] == false {
+			DPrintf("Connect %d\n", i)
 			cfg.connect(i)
 		}
 	}
 
-	cfg.one(rand.Int()%10000, servers, true)
+	cfg.one(1, servers, true)
 
 	cfg.end()
 }
