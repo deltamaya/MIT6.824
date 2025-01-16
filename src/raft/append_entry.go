@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"sync"
 	"time"
 )
 
@@ -22,10 +21,11 @@ func (rf *Raft) syncEntries() {
 	}
 	rf.persist()
 	defer rf.persist()
-
 	DPrintf("Term %03d: Peer %03d syncing entires\n", rf.currentTerm, rf.me)
+
+	rf.mu.Unlock()
+
 	reachable := 1
-	mtx := sync.Mutex{}
 	allSuccess := true
 	DPrintf("Leader log: %v\n", rf.log)
 	for idx := range rf.peers {
@@ -33,7 +33,7 @@ func (rf *Raft) syncEntries() {
 			continue
 		}
 		go func(idx int) {
-			mtx.Lock()
+			rf.mu.Lock()
 			prevLogIndex, prevLogTerm, logs := rf.getAppendEntries(idx)
 			args := AppendEntryArgs{
 				Term:         rf.currentTerm,
@@ -44,22 +44,27 @@ func (rf *Raft) syncEntries() {
 				LeaderCommit: rf.commitIndex,
 			}
 			reply := AppendEntryReply{}
-			mtx.Unlock()
+			rf.mu.Unlock()
 			ok := rf.sendAppendEntry(idx, &args, &reply)
 			if !ok {
 				return
 			}
-			mtx.Lock()
-			defer mtx.Unlock()
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 
 			reachable++
 			if !reply.Success {
 				allSuccess = false
-				if reply.NextLogIndex != 0 {
-					rf.nextIndex[idx] = reply.NextLogIndex
+				if reply.NextLogIndex > 0 {
+					if reply.NextLogIndex > rf.prevSnapshotIndex {
+						rf.nextIndex[idx] = reply.NextLogIndex
+					} else {
+						go rf.sendInstallSnapshotToPeer(idx)
+					}
 				}
 				return
 			}
+
 			if reply.NextLogIndex > rf.nextIndex[idx] {
 				rf.nextIndex[idx] = reply.NextLogIndex
 				rf.matchIndex[idx] = reply.NextLogIndex - 1
@@ -83,14 +88,16 @@ func (rf *Raft) syncEntries() {
 					rf.notifyApplyCh <- struct{}{}
 				}
 			}
+
 		}(idx)
 	}
 	time.Sleep(50 * time.Millisecond)
+
+	rf.mu.Lock()
+
 	if rf.killed() {
 		return
 	}
-	mtx.Lock()
-	defer mtx.Unlock()
 
 	rf.electionTimer = time.NewTimer(randomElectionTimeout())
 

@@ -93,7 +93,9 @@ type Raft struct {
 	appendEntryRetry int
 
 	// represent the absolute index of the begining of the peer's log entries
-	snapshotIndex int
+	prevSnapshotIndex int
+	prevSnapshotTerm  int
+	currentSnapshot   []byte
 }
 
 // return currentTerm and whether this server
@@ -117,22 +119,8 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
-
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.log)
-	state := w.Bytes()
-	rf.persister.Save(state, nil)
+	state := rf.getStateData()
+	rf.persister.Save(state, rf.currentSnapshot)
 }
 
 // restore previously persisted state.
@@ -140,19 +128,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var currentTerm int
@@ -168,6 +143,17 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.votedFor = votedFor
 	rf.log = log
 
+	rf.currentSnapshot = rf.getSnapshotData()
+}
+
+func (rf *Raft) getStateData() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	state := w.Bytes()
+	return state
 }
 
 // example RequestVote RPC arguments structure.
@@ -279,13 +265,16 @@ func (rf *Raft) applyCommitedLogs() {
 			CommandIndex: i,
 		}
 		msgs = append(msgs, msg)
-		rf.lastApplied = i
 	}
-	go func() {
-		for _, msg := range msgs {
-			rf.applyCh <- msg
-		}
-	}()
+	rf.mu.Unlock()
+	for _, msg := range msgs {
+		rf.applyCh <- msg
+		rf.mu.Lock()
+		rf.lastApplied = msg.CommandIndex
+		rf.mu.Unlock()
+	}
+	rf.mu.Lock()
+
 }
 
 type LogEntry struct {
@@ -368,6 +357,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	rf.notifyApplyCh = make(chan struct{}, 10)
 	rf.syncEntriesCh = make(chan struct{}, 10)
+	rf.currentSnapshot = nil
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 

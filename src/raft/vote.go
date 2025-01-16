@@ -103,7 +103,7 @@ func (rf *Raft) requestElection() {
 		}(idx)
 	}
 
-	time.Sleep(RPCTimeout)
+	time.Sleep(50 * time.Millisecond)
 	if rf.killed() {
 		return
 	}
@@ -113,7 +113,7 @@ func (rf *Raft) requestElection() {
 	// vote is greater than half, become leader
 	if rf.isMajority(voteCount) {
 		rf.candidateToLeader()
-		rf.syncEntries()
+		rf.resetSyncTimeTrigger()
 	}
 	rf.electionTimer = time.NewTimer(randomElectionTimeout())
 
