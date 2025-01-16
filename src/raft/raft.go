@@ -39,7 +39,7 @@ const (
 
 const (
 	RPCTimeout        = 30 * time.Millisecond
-	HeartbeatInterval = 150 * time.Millisecond
+	HeartbeatInterval = 50 * time.Millisecond
 	ElectionTimeout   = 300 * time.Millisecond
 	ApplyInterval     = 100 * time.Millisecond
 	TickInterval      = 10 * time.Millisecond
@@ -297,7 +297,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	case <-ret:
 		return true
 	case <-timeout.C:
-		DPrintf("Term %03d Peer %03d Requset Vote to %03d timeout\n", args.Term, rf.me, server)
+		DPrintf("Term %03d Peer %03d Request Vote to %03d timeout\n", args.Term, rf.me, server)
 		stopCh <- struct{}{}
 		return false
 	}
@@ -385,6 +385,9 @@ func (rf *Raft) ticker() {
 	}
 }
 
+func (rf *Raft) resetSyncTime() {
+	rf.syncEntriesTimer = time.NewTimer(HeartbeatInterval)
+}
 func (rf *Raft) resetSyncTimeTrigger() {
 	rf.syncEntriesCh <- struct{}{}
 	rf.syncEntriesTimer = time.NewTimer(HeartbeatInterval)
@@ -483,7 +486,6 @@ func (rf *Raft) getAppendEntries(peerID int) (int, int, []LogEntry) {
 	prevLogTerm := rf.log[prevLogIndex].Term
 	entries := rf.log[nextIndex:]
 	return prevLogIndex, prevLogTerm, entries
-
 }
 
 func (rf *Raft) syncEntries() {
@@ -499,62 +501,66 @@ func (rf *Raft) syncEntries() {
 	DPrintf("Term %03d: Peer %03d syncing entires\n", rf.currentTerm, rf.me)
 	reachable := 1
 	mtx := sync.Mutex{}
+	allSuccess := true
 	DPrintf("Leader log: %v\n", rf.log)
 	for idx := range rf.peers {
 		if idx == rf.me {
 			continue
 		}
-		prevLogIndex, prevLogTerm, logs := rf.getAppendEntries(idx)
-		args := AppendEntryArgs{
-			Term:         rf.currentTerm,
-			LeaderID:     rf.me,
-			PrevLogIndex: prevLogIndex,
-			PrevLogTerm:  prevLogTerm,
-			Entries:      logs,
-			LeaderCommit: rf.commitIndex,
-		}
-		reply := AppendEntryReply{}
 		go func(idx int) {
+			mtx.Lock()
+			prevLogIndex, prevLogTerm, logs := rf.getAppendEntries(idx)
+			args := AppendEntryArgs{
+				Term:         rf.currentTerm,
+				LeaderID:     rf.me,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      logs,
+				LeaderCommit: rf.commitIndex,
+			}
+			reply := AppendEntryReply{}
+			mtx.Unlock()
 			ok := rf.sendAppendEntry(idx, &args, &reply)
 			if !ok {
 				return
 			}
 			mtx.Lock()
 			defer mtx.Unlock()
-			reachable++
 
-			if reply.Success {
-				if reply.NextLogIndex > rf.nextIndex[idx] {
+			reachable++
+			if !reply.Success {
+				allSuccess = false
+				if reply.NextLogIndex != 0 {
 					rf.nextIndex[idx] = reply.NextLogIndex
-					rf.matchIndex[idx] = reply.NextLogIndex - 1
 				}
-				if len(args.Entries) > 0 && args.Entries[len(args.Entries)-1].Term == rf.currentTerm {
-					hasCommit := false
-					for i := rf.commitIndex + 1; i <= rf.matchIndex[idx]; i++ {
-						count := 1
-						for j := 0; j < len(rf.peers); j++ {
-							if i <= rf.matchIndex[j] {
-								count++
-							}
-						}
-						if rf.isMajority(count) {
-							rf.commitIndex = i
-							hasCommit = true
-						}
-					}
-					if hasCommit {
-						DPrintf("Term %03d Leader %03d update commit index -> %d\n", rf.currentTerm, rf.me, rf.commitIndex)
-						rf.notifyApplyCh <- struct{}{}
-					}
-				}
+				return
 			}
-			if reply.NextLogIndex != 0 {
+			if reply.NextLogIndex > rf.nextIndex[idx] {
 				rf.nextIndex[idx] = reply.NextLogIndex
+				rf.matchIndex[idx] = reply.NextLogIndex - 1
 			}
-			rf.persist()
+			if len(args.Entries) > 0 && args.Entries[len(args.Entries)-1].Term == rf.currentTerm {
+				hasCommit := false
+				for i := rf.commitIndex + 1; i <= rf.matchIndex[idx]; i++ {
+					count := 0
+					for j := 0; j < len(rf.peers); j++ {
+						if i <= rf.matchIndex[j] || j == rf.me {
+							count++
+						}
+					}
+					if rf.isMajority(count) {
+						rf.commitIndex = i
+						hasCommit = true
+					}
+				}
+				if hasCommit {
+					DPrintf("Term %03d Leader %03d update commit index -> %d\n", rf.currentTerm, rf.me, rf.commitIndex)
+					rf.notifyApplyCh <- struct{}{}
+				}
+			}
 		}(idx)
 	}
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 	if rf.killed() {
 		return
 	}
@@ -574,7 +580,11 @@ func (rf *Raft) syncEntries() {
 		return
 	}
 	rf.appendEntryRetry = 0
-	rf.syncEntriesTimer = time.NewTimer(HeartbeatInterval)
+	if allSuccess {
+		rf.resetSyncTime()
+	} else {
+		rf.resetSyncTimeTrigger()
+	}
 }
 
 func (rf *Raft) leaderToFollower() {
@@ -587,7 +597,10 @@ func (rf *Raft) candidateToLeader() {
 	DPrintf("Term %03d: Candidate %03d became Leader\n", rf.currentTerm, rf.me)
 	rf.identity = LEADER
 	rf.electionTimer = time.NewTimer(randomElectionTimeout())
-	rf.syncEntriesTimer = time.NewTimer(HeartbeatInterval)
+	rf.appendEntryRetry = 0
+
+	rf.resetSyncTime()
+
 	count := len(rf.peers)
 	rf.nextIndex = make([]int, count)
 	lastLogIndex := len(rf.log) - 1
@@ -606,12 +619,12 @@ func (rf *Raft) isMajority(n int) bool {
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
-	timeout := time.NewTimer(3 * RPCTimeout)
+	timeout := time.NewTimer(RPCTimeout)
 	defer timeout.Stop()
 	ret := make(chan struct{}, 1)
 	stopCh := make(chan struct{}, 1)
 	go func() {
-		for i := 0; i < 3; i++ {
+		for i := 0; i < 10; i++ {
 			if rf.killed() {
 				return
 			}
@@ -706,18 +719,17 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		DPrintf("Term %03d Follower %03d update commit to %03d\n", rf.currentTerm, rf.me, idx)
 	}
 
-	if len(args.Entries) == 0 {
-		reply.Success = true
-		return
-	}
-
-	// matched, replicate logs
+	// outdated append entry rpc, reply success
 	lastLogTerm := rf.log[lastLogIndex].Term
-	if lastLogTerm == args.Term && len(rf.log) > args.PrevLogIndex+1+len(args.Entries) {
+	argsLastIndex := args.PrevLogIndex + 1 + len(args.Entries)
+	if lastLogTerm == args.Term && len(rf.log) > argsLastIndex {
+		DPrintf("Term %03d Peer %03d received outdated RPC: lastLogIndex: %d, entryLastIndex: %d\n", rf.currentTerm, rf.me, lastLogIndex, argsLastIndex)
 		reply.Success = true
 		reply.NextLogIndex = len(rf.log)
 		return
 	}
+
+	// matched, replicate logs
 	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 	reply.Success = true
 	reply.NextLogIndex = len(rf.log)
