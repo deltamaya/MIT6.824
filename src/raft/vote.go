@@ -86,12 +86,13 @@ func (rf *Raft) requestElection() {
 		if idx == rf.me {
 			continue
 		}
-		lastLogIndex := len(rf.log) - 1
+		lastLogIndex := rf.logLengthAbs() - 1
 		args := RequestVoteArgs{
 			CandidateID:  rf.me,
 			Term:         rf.currentTerm,
 			LastLogIndex: lastLogIndex,
-			LastLogTerm:  rf.log[lastLogIndex].Term}
+			LastLogTerm:  rf.log[rf.logIndexAbs(lastLogIndex)].Term,
+		}
 		go func(idx int) {
 			ok := rf.sendRequestVote(idx, &args, &replies[idx])
 			if ok && replies[idx].VoteGranted {
@@ -140,8 +141,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 	}
 	// args.Term == rf.currentTerm
-	lastLogIndex := len(rf.log) - 1
-	lastLogTerm := rf.log[lastLogIndex].Term
+	lastLogIndex := rf.logLengthAbs() - 1
+	lastLogTerm := rf.log[rf.logIndexAbs(lastLogIndex)].Term
 	if lastLogTerm > args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
 		reply.VoteGranted = false
 		DPrintf("Term %03d: Peer %03d against Peer %03d, outdated log %03d, at term %03d\n", rf.currentTerm, rf.me, args.CandidateID, args.LastLogIndex, args.LastLogTerm)

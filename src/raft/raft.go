@@ -91,6 +91,9 @@ type Raft struct {
 	notifyApplyCh    chan struct{}
 	syncEntriesCh    chan struct{}
 	appendEntryRetry int
+
+	// represent the absolute index of the begining of the peer's log entries
+	snapshotIndex int
 }
 
 // return currentTerm and whether this server
@@ -167,15 +170,6 @@ func (rf *Raft) readPersist(data []byte) {
 
 }
 
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
-
-}
-
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
@@ -222,8 +216,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 
-	index = len(rf.log)
-
+	index = rf.logLengthAbs()
 	rf.log = append(rf.log, LogEntry{
 		Term:    rf.currentTerm,
 		Command: command,
@@ -276,25 +269,23 @@ func (rf *Raft) ticker() {
 	}
 }
 
-func (rf *Raft) resetSyncTime() {
-	rf.syncEntriesTimer = time.NewTimer(HeartbeatInterval)
-}
-func (rf *Raft) resetSyncTimeTrigger() {
-	rf.syncEntriesCh <- struct{}{}
-	rf.syncEntriesTimer = time.NewTimer(HeartbeatInterval)
-}
-
 func (rf *Raft) applyCommitedLogs() {
 	DPrintf("Applying log in Peer %03d with log %v\n", rf.me, rf.log)
+	msgs := make([]ApplyMsg, 10)
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		msg := ApplyMsg{
 			CommandValid: true,
-			Command:      rf.log[i].Command,
+			Command:      rf.log[rf.logIndexAbs(i)].Command,
 			CommandIndex: i,
 		}
-		rf.applyCh <- msg
+		msgs = append(msgs, msg)
 		rf.lastApplied = i
 	}
+	go func() {
+		for _, msg := range msgs {
+			rf.applyCh <- msg
+		}
+	}()
 }
 
 type LogEntry struct {
@@ -334,7 +325,7 @@ func (rf *Raft) candidateToLeader() {
 
 	count := len(rf.peers)
 	rf.nextIndex = make([]int, count)
-	lastLogIndex := len(rf.log) - 1
+	lastLogIndex := rf.logLengthAbs() - 1
 	for i := 0; i < count; i++ {
 		rf.nextIndex[i] = lastLogIndex + 1
 	}

@@ -8,8 +8,8 @@ import (
 func (rf *Raft) getAppendEntries(peerID int) (int, int, []LogEntry) {
 	nextIndex := rf.nextIndex[peerID]
 	prevLogIndex := nextIndex - 1
-	prevLogTerm := rf.log[prevLogIndex].Term
-	entries := rf.log[nextIndex:]
+	prevLogTerm := rf.log[rf.logIndexAbs(prevLogIndex)].Term
+	entries := rf.log[rf.logIndexAbs(nextIndex):]
 	return prevLogIndex, prevLogTerm, entries
 }
 
@@ -176,7 +176,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 	rf.electionTimer = time.NewTimer(randomElectionTimeout())
 
-	lastLogIndex := len(rf.log) - 1
+	lastLogIndex := rf.logLengthAbs() - 1
 
 	// has log gap
 	if args.PrevLogIndex > lastLogIndex {
@@ -189,14 +189,14 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 
 	// term mismatch
-	if lastLogIndex != 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if lastLogIndex != 0 && rf.log[rf.logIndexAbs(args.PrevLogIndex)].Term != args.PrevLogTerm {
 		reply.Success = false
 		index := args.PrevLogIndex
-		for index > rf.commitIndex && rf.log[index].Term == rf.log[args.PrevLogIndex].Term {
+		for index > rf.commitIndex && rf.log[rf.logIndexAbs(index)].Term == rf.log[rf.logIndexAbs(args.PrevLogIndex)].Term {
 			index--
 		}
 		reply.NextLogIndex = index + 1
-		DPrintf("Term %03d Peer %03d refuse ae for term mismatch(%d!=%d), next: %03d\n", rf.currentTerm, rf.me, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, reply.NextLogIndex)
+		DPrintf("Term %03d Peer %03d refuse ae for term mismatch(%d!=%d), next: %03d\n", rf.currentTerm, rf.me, rf.log[rf.logIndexAbs(args.PrevLogIndex)].Term, args.PrevLogTerm, reply.NextLogIndex)
 		DPrintf("Term %03d Peer %03d logs: %v args: %v\n", rf.currentTerm, rf.me, rf.log, args.Entries)
 		return
 	}
@@ -214,19 +214,27 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 
 	// outdated append entry rpc, reply success
-	lastLogTerm := rf.log[lastLogIndex].Term
+	lastLogTerm := rf.log[rf.logIndexAbs(lastLogIndex)].Term
 	argsLastIndex := args.PrevLogIndex + 1 + len(args.Entries)
-	if lastLogTerm == args.Term && len(rf.log) > argsLastIndex {
+	if lastLogTerm == args.Term && rf.logLengthAbs() > argsLastIndex {
 		DPrintf("Term %03d Peer %03d received outdated RPC: lastLogIndex: %d, entryLastIndex: %d\n", rf.currentTerm, rf.me, lastLogIndex, argsLastIndex)
 		reply.Success = true
-		reply.NextLogIndex = len(rf.log)
+		reply.NextLogIndex = rf.logLengthAbs()
 		return
 	}
 
 	// matched, replicate logs
-	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	rf.log = append(rf.log[:rf.logIndexAbs(args.PrevLogIndex+1)], args.Entries...)
 	reply.Success = true
-	reply.NextLogIndex = len(rf.log)
+	reply.NextLogIndex = rf.logLengthAbs()
 	DPrintf("Term %03d Peer %03d accepted ae, next: %03d\n", rf.currentTerm, rf.me, reply.NextLogIndex)
 	DPrintf("Term %03d Peer %03d logs: %v args: %v\n", rf.currentTerm, rf.me, rf.log, args.Entries)
+}
+
+func (rf *Raft) resetSyncTime() {
+	rf.syncEntriesTimer = time.NewTimer(HeartbeatInterval)
+}
+func (rf *Raft) resetSyncTimeTrigger() {
+	rf.syncEntriesCh <- struct{}{}
+	rf.syncEntriesTimer = time.NewTimer(HeartbeatInterval)
 }
