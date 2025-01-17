@@ -93,8 +93,8 @@ type Raft struct {
 	appendEntryRetry int
 
 	// represent the absolute index of the begining of the peer's log entries
-	prevSnapshotIndex int
-	prevSnapshotTerm  int
+	lastSnapshotIndex int
+	lastSnapshotTerm  int
 	currentSnapshot   []byte
 }
 
@@ -256,7 +256,7 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) applyCommitedLogs() {
-	DPrintf("Applying log in Peer %03d with log %v\n", rf.me, rf.log)
+	DPrintf("Applying log in Peer %03d, snapshot: %d, lastApplied: %d, commitIndex: %d with log %v\n", rf.me, rf.lastSnapshotIndex, rf.lastApplied, rf.commitIndex, rf.log)
 	msgs := make([]ApplyMsg, 10)
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		msg := ApplyMsg{
@@ -270,7 +270,10 @@ func (rf *Raft) applyCommitedLogs() {
 	for _, msg := range msgs {
 		rf.applyCh <- msg
 		rf.mu.Lock()
-		rf.lastApplied = msg.CommandIndex
+		if msg.CommandIndex > rf.lastApplied {
+			rf.lastApplied = msg.CommandIndex
+		}
+
 		rf.mu.Unlock()
 	}
 	rf.mu.Lock()

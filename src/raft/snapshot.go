@@ -13,18 +13,18 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if rf.killed() {
 		return
 	}
-	DPrintf("Peer: %03d Snap shot called: %d\n", rf.me, index)
+	DPrintf("Peer: %03d SNAPSHOT called: %d\n", rf.me, index)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if index < rf.prevSnapshotIndex {
+	if index < rf.lastSnapshotIndex {
 		return
 	}
 	rf.log = rf.log[rf.logIndexAbs(index):]
 
-	rf.prevSnapshotIndex = index
-	rf.prevSnapshotTerm = rf.log[rf.logIndexAbs(index)].Term
+	rf.lastSnapshotIndex = index
+	rf.lastSnapshotTerm = rf.log[rf.logIndexAbs(index)].Term
 	rf.currentSnapshot = snapshot
 
 	rf.log[0].Command = nil
@@ -32,11 +32,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 func (rf *Raft) logIndexAbs(idx int) int {
-	return idx - rf.prevSnapshotIndex
+	return idx - rf.lastSnapshotIndex
 }
 
 func (rf *Raft) logLengthAbs() int {
-	return len(rf.log) + rf.prevSnapshotIndex
+	return len(rf.log) + rf.lastSnapshotIndex
 }
 
 func (rf *Raft) getSnapshotData() []byte {
@@ -77,6 +77,7 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 				ret <- struct{}{}
 				break
 			}
+			time.Sleep(10 * time.Millisecond)
 		}
 	}()
 	select {
@@ -94,6 +95,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	if rf.currentTerm > args.Term {
+		DPrintf("Term %03d Peer %03d received outdated snapshot term: %d\n", rf.currentTerm, rf.me, args.Term)
 		return
 	}
 	if args.Term > rf.currentTerm {
@@ -104,20 +106,21 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.electionTimer = time.NewTimer(randomElectionTimeout())
-		rf.currentSnapshot = args.Data
-
-		rf.prevSnapshotIndex = args.LastIncludedIndex
-		rf.prevSnapshotTerm = args.LastIncludedTerm
-		rf.log = []LogEntry{
-			{},
-		}
-		rf.currentSnapshot = args.Data
-		rf.persist()
 	}
-
-	if args.LastIncludedIndex < rf.prevSnapshotIndex {
+	if args.LastIncludedIndex <= rf.lastSnapshotIndex {
+		DPrintf("Term %03d Peer %03d received outdated snapshot index: %d, my: %d\n", rf.currentTerm, rf.me, args.LastIncludedIndex, rf.lastSnapshotIndex)
 		return
 	}
+	rf.lastSnapshotIndex = args.LastIncludedIndex
+	rf.lastSnapshotTerm = args.LastIncludedTerm
+	rf.currentSnapshot = args.Data
+	rf.commitIndex = args.LastIncludedIndex
+	rf.lastApplied = args.LastIncludedIndex
+	rf.log = []LogEntry{
+		{Term: args.LastIncludedTerm},
+	}
+
+	rf.persist()
 	DPrintf("Term %03d Peer %03d installed snapshot\n", rf.currentTerm, rf.me)
 	rf.applyCh <- ApplyMsg{
 		SnapshotValid: true,
@@ -128,30 +131,33 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 }
 
 func (rf *Raft) sendInstallSnapshotToPeer(idx int) {
-	rf.mu.Lock()
-	DPrintf("sending install snapshot to %03d\n", idx)
+	for {
+		rf.mu.Lock()
+		args := InstallSnapshotArgs{
+			Term:              rf.currentTerm,
+			LeaderID:          rf.me,
+			LastIncludedIndex: rf.lastSnapshotIndex,
+			LastIncludedTerm:  rf.lastSnapshotTerm,
+			Data:              rf.currentSnapshot,
+		}
+		DPrintf("sending install snapshot to %03d lastIncludedIndex: %d\n", idx, rf.lastSnapshotIndex)
+		rf.mu.Unlock()
+		reply := InstallSnapshotReply{}
+		ok := rf.sendInstallSnapshot(idx, &args, &reply)
+		if !ok {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
 
-	args := InstallSnapshotArgs{
-		Term:              rf.currentTerm,
-		LeaderID:          rf.me,
-		LastIncludedIndex: rf.prevSnapshotIndex,
-		LastIncludedTerm:  rf.prevSnapshotTerm,
-		Data:              rf.currentSnapshot,
-	}
-	rf.mu.Unlock()
-
-	reply := InstallSnapshotReply{}
-	ok := rf.sendInstallSnapshot(idx, &args, &reply)
-	if !ok {
+		rf.mu.Lock()
+		if args.LastIncludedIndex > rf.matchIndex[idx] {
+			rf.matchIndex[idx] = args.LastIncludedIndex
+		}
+		if args.LastIncludedIndex+1 > rf.nextIndex[idx] {
+			rf.nextIndex[idx] = args.LastIncludedIndex + 1
+		}
+		rf.mu.Unlock()
 		return
 	}
 
-	rf.mu.Lock()
-	if args.LastIncludedIndex > rf.matchIndex[idx] {
-		rf.matchIndex[idx] = args.LastIncludedIndex
-	}
-	if args.LastIncludedIndex+1 > rf.nextIndex[idx] {
-		rf.nextIndex[idx] = args.LastIncludedIndex + 1
-	}
-	rf.mu.Unlock()
 }

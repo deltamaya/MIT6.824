@@ -6,8 +6,15 @@ import (
 
 func (rf *Raft) getAppendEntries(peerID int) (int, int, []LogEntry) {
 	nextIndex := rf.nextIndex[peerID]
+	lastLogIndex := rf.logLengthAbs() - 1
+	if nextIndex <= rf.lastSnapshotIndex || nextIndex > lastLogIndex {
+		prevLogIndex := lastLogIndex
+		prevLogTerm := rf.log[rf.logIndexAbs(prevLogIndex)].Term
+		return prevLogIndex, prevLogTerm, []LogEntry{}
+	}
 	prevLogIndex := nextIndex - 1
 	prevLogTerm := rf.log[rf.logIndexAbs(prevLogIndex)].Term
+
 	entries := rf.log[rf.logIndexAbs(nextIndex):]
 	return prevLogIndex, prevLogTerm, entries
 }
@@ -22,12 +29,11 @@ func (rf *Raft) syncEntries() {
 	rf.persist()
 	defer rf.persist()
 	DPrintf("Term %03d: Peer %03d syncing entires\n", rf.currentTerm, rf.me)
-
-	rf.mu.Unlock()
-
 	reachable := 1
 	allSuccess := true
 	DPrintf("Leader log: %v\n", rf.log)
+	rf.mu.Unlock()
+
 	for idx := range rf.peers {
 		if idx == rf.me {
 			continue
@@ -56,13 +62,12 @@ func (rf *Raft) syncEntries() {
 			if !reply.Success {
 				allSuccess = false
 				if reply.NextLogIndex > 0 {
-					if reply.NextLogIndex > rf.prevSnapshotIndex {
+					if reply.NextLogIndex > rf.lastSnapshotIndex {
 						rf.nextIndex[idx] = reply.NextLogIndex
 					} else {
 						go rf.sendInstallSnapshotToPeer(idx)
 					}
 				}
-				return
 			}
 
 			if reply.NextLogIndex > rf.nextIndex[idx] {
@@ -185,6 +190,14 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	lastLogIndex := rf.logLengthAbs() - 1
 
+	if args.PrevLogIndex < rf.lastSnapshotIndex {
+		reply.Success = false
+		reply.NextLogIndex = rf.lastSnapshotIndex + 1
+		DPrintf("Term %03d Peer %03d refuse newer snapshot: %d, prevLogIndex: %d\n", rf.currentTerm, rf.me, rf.lastSnapshotIndex, args.PrevLogIndex)
+		DPrintf("Term %03d Peer %03d log: %v args: %v\n", rf.currentTerm, rf.me, rf.log, args.Entries)
+		return
+	}
+
 	// has log gap
 	if args.PrevLogIndex > lastLogIndex {
 		reply.Success = false
@@ -208,6 +221,16 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		return
 	}
 
+	// outdated append entry rpc, reply success
+	lastLogTerm := rf.log[rf.logIndexAbs(lastLogIndex)].Term
+	argsLastIndex := args.PrevLogIndex + 1 + len(args.Entries)
+	if lastLogTerm == args.Term && rf.logLengthAbs() > argsLastIndex {
+		DPrintf("Term %03d Peer %03d received outdated RPC: lastLogIndex: %d, entryLastIndex: %d\n", rf.currentTerm, rf.me, lastLogIndex, argsLastIndex)
+		reply.Success = false
+		reply.NextLogIndex = 0
+		return
+	}
+
 	if args.LeaderCommit > rf.commitIndex {
 		idx := 0
 		if lastLogIndex < args.LeaderCommit {
@@ -218,16 +241,6 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.commitIndex = idx
 		rf.notifyApplyCh <- struct{}{}
 		DPrintf("Term %03d Follower %03d update commit to %03d\n", rf.currentTerm, rf.me, idx)
-	}
-
-	// outdated append entry rpc, reply success
-	lastLogTerm := rf.log[rf.logIndexAbs(lastLogIndex)].Term
-	argsLastIndex := args.PrevLogIndex + 1 + len(args.Entries)
-	if lastLogTerm == args.Term && rf.logLengthAbs() > argsLastIndex {
-		DPrintf("Term %03d Peer %03d received outdated RPC: lastLogIndex: %d, entryLastIndex: %d\n", rf.currentTerm, rf.me, lastLogIndex, argsLastIndex)
-		reply.Success = true
-		reply.NextLogIndex = rf.logLengthAbs()
-		return
 	}
 
 	// matched, replicate logs
