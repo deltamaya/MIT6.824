@@ -132,18 +132,27 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var votedFor int
+	var lastSnapshotIndex int
+	var lastSnapshotTerm int
 	var log []LogEntry
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
+		d.Decode(&lastSnapshotIndex) != nil ||
+		d.Decode(&lastSnapshotTerm) != nil ||
 		d.Decode(&log) != nil {
 		DPrintf("Unable to decode\n")
 		return
 	}
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
+	rf.lastSnapshotIndex = lastSnapshotIndex
+	rf.lastSnapshotTerm = lastSnapshotTerm
 	rf.log = log
 
 	rf.currentSnapshot = rf.getSnapshotData()
+
+	rf.commitIndex = rf.lastSnapshotIndex
+	rf.lastApplied = rf.lastSnapshotIndex
 }
 
 func (rf *Raft) getStateData() []byte {
@@ -151,6 +160,8 @@ func (rf *Raft) getStateData() []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
+	e.Encode(rf.lastSnapshotIndex)
+	e.Encode(rf.lastSnapshotTerm)
 	e.Encode(rf.log)
 	state := w.Bytes()
 	return state

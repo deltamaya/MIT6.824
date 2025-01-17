@@ -10,7 +10,6 @@ package raft
 
 import (
 	"fmt"
-	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -111,7 +110,7 @@ func TestManyElections3A(t *testing.T) {
 		cfg.disconnect(i1)
 		cfg.disconnect(i2)
 		cfg.disconnect(i3)
-		log.Printf("Disconnected Peer: %03d, %03d, %03d\n", i1, i2, i3)
+		DPrintf("Disconnected Peer: %03d, %03d, %03d\n", i1, i2, i3)
 		// either the current leader should still be alive,
 		// or the remaining four should elect a new one.
 		cfg.checkOneLeader()
@@ -119,7 +118,7 @@ func TestManyElections3A(t *testing.T) {
 		cfg.connect(i1)
 		cfg.connect(i2)
 		cfg.connect(i3)
-		log.Printf("Connected Peer: %03d, %03d, %03d\n", i1, i2, i3)
+		DPrintf("Connected Peer: %03d, %03d, %03d\n", i1, i2, i3)
 	}
 
 	cfg.checkOneLeader()
@@ -1248,11 +1247,13 @@ func TestSnapshotAllCrash3D(t *testing.T) {
 
 		// crash all
 		for i := 0; i < servers; i++ {
+			DPrintf("Crash all")
 			cfg.crash1(i)
 		}
 
 		// revive all
 		for i := 0; i < servers; i++ {
+			DPrintf("Restart all")
 			cfg.start1(i, cfg.applierSnap)
 			cfg.connect(i)
 		}
