@@ -1,15 +1,16 @@
 package kvraft
 
 import (
-	"6.5840/labgob"
-	"6.5840/labrpc"
-	"6.5840/raft"
 	"log"
 	"sync"
 	"sync/atomic"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,11 +19,20 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Name      string
+	Key       string
+	Value     string
+	ClerkID   int
+	RequestID int
+}
+
+type ResponseCache struct {
+	ClerkID   int
+	RequestID int
 }
 
 type KVServer struct {
@@ -35,19 +45,129 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	data          map[string]string
+	responseCache map[int]ResponseCache
+	resultCh      chan Result
 }
 
+type Result struct {
+	ClerkID   int
+	RequestID int
+	Value     string
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	op := Op{
+		Name:      "Get",
+		Key:       args.Key,
+		Value:     "",
+		ClerkID:   args.ClerkID,
+		RequestID: args.RequestID,
+	}
+	idx, _, isleader := kv.rf.Start(op)
+	if !isleader {
+		DPrintf("Peer %03d is not leader, rejecting request.\n", kv.me)
+		reply.Err = ErrWrongLeader
+		return
+	}
+	go kv.handleGetReply(args, reply)
+
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	op := Op{
+		Name:      "Put",
+		Key:       args.Key,
+		Value:     args.Value,
+		ClerkID:   args.ClerkID,
+		RequestID: args.RequestID,
+	}
+	idx, _, isleader := kv.rf.Start(op)
+	if !isleader {
+		DPrintf("Peer %03d is not leader, rejecting request.\n", kv.me)
+		reply.Err = ErrWrongLeader
+		return
+	}
+	for {
+		msg := <-kv.applyCh
+		DPrintf("Peer %03d got msg %v.\n", kv.me, msg)
+
+		if msg.CommandValid &&
+			idx == msg.CommandIndex &&
+			msg.Command != nil {
+			op = msg.Command.(Op)
+			if op.ClerkID == args.ClerkID &&
+				op.RequestID == args.RequestID {
+				value := args.Value
+				kv.data[args.Key] = value
+				reply.Err = OK
+				DPrintf("Peer %03d replied request.\n", kv.me)
+				break
+			}
+		}
+	}
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	op := Op{
+		Name:      "Append",
+		Key:       args.Key,
+		Value:     args.Value,
+		ClerkID:   args.ClerkID,
+		RequestID: args.RequestID,
+	}
+	idx, _, isleader := kv.rf.Start(op)
+	if !isleader {
+		DPrintf("Peer %03d is not leader, rejecting request.\n", kv.me)
+		reply.Err = ErrWrongLeader
+		return
+	}
+	for {
+		msg := <-kv.applyCh
+		DPrintf("Peer %03d got msg %v.\n", kv.me, msg)
+
+		if msg.CommandValid &&
+			idx == msg.CommandIndex &&
+			msg.Command != nil {
+			op = msg.Command.(Op)
+			if op.ClerkID == args.ClerkID &&
+				op.RequestID == args.RequestID {
+				oldValue, ok := kv.data[args.Key]
+				if !ok {
+					oldValue = ""
+				}
+				kv.data[args.Key] = oldValue + args.Value
+				reply.Err = OK
+				DPrintf("Peer %03d replied request.\n", kv.me)
+				break
+			}
+		}
+	}
+}
+
+func (kv *KVServer) executeCommand(op Op) string {
+	if op.Name == "Get" {
+		return kv.data[op.Key]
+	} else if op.Name == "Put" {
+		kv.data[op.Key] = op.Value
+		return ""
+	} else {
+		oldValue, ok := kv.data[op.Key]
+		if !ok {
+			oldValue = ""
+		}
+		kv.data[op.Key] = oldValue + op.Value
+		return ""
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -94,8 +214,34 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.data = make(map[string]string)
+	kv.responseCache = make(map[int]ResponseCache)
 
 	// You may need initialization code here.
-
 	return kv
+}
+
+func (kv *KVServer) handleGetReply(targetIndex int,args *GetArgs, reply *GetReply) {
+	for {
+		msg := <-kv.applyCh
+		DPrintf("Peer %03d got msg %v.\n", kv.me, msg)
+		if msg.CommandValid {
+			if msg.CommandIndex==
+		} else if msg.SnapshotValid {
+
+		}
+		if msg.CommandValid &&
+			idx == msg.CommandIndex &&
+			msg.Command != nil {
+			op = msg.Command.(Op)
+			if op.ClerkID == args.ClerkID &&
+				op.RequestID == args.RequestID {
+				value := kv.data[args.Key]
+				reply.Value = value
+				reply.Err = OK
+				DPrintf("Peer %03d replied request.\n", kv.me)
+				break
+			}
+		}
+	}
 }
