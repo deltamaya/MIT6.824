@@ -108,7 +108,7 @@ func (rf *Raft) syncEntries() {
 		return
 	}
 
-	rf.electionTimer = time.NewTimer(randomElectionTimeout())
+	rf.electionTimer.Reset(randomElectionTimeout())
 
 	if !rf.isMajority(reachable) {
 		if rf.appendEntryRetry < 3 {
@@ -190,7 +190,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
 	}
-	rf.electionTimer = time.NewTimer(randomElectionTimeout())
+	rf.electionTimer.Reset(randomElectionTimeout())
 
 	lastLogIndex := rf.logLengthAbs() - 1
 

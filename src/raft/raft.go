@@ -319,12 +319,12 @@ func (rf *Raft) leaderToFollower() {
 	DPrintf("Term %03d: Leader %03d became Follower\n", rf.currentTerm, rf.me)
 	rf.identity = FOLLOWER
 	rf.syncEntriesTimer.Stop()
-	rf.electionTimer = time.NewTimer(randomElectionTimeout())
+	rf.electionTimer.Reset(randomElectionTimeout())
 }
 func (rf *Raft) candidateToLeader() {
 	DPrintf("Term %03d: Candidate %03d became Leader\n", rf.currentTerm, rf.me)
 	rf.identity = LEADER
-	rf.electionTimer = time.NewTimer(randomElectionTimeout())
+	rf.electionTimer.Reset(randomElectionTimeout())
 	rf.appendEntryRetry = 0
 
 	rf.resetSyncTimeTrigger()

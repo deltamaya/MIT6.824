@@ -21,12 +21,19 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if index < rf.lastSnapshotIndex {
 		return
 	}
-	rf.log = rf.log[rf.logIndexAbs(index):]
+	if rf.logLengthAbs() <= index {
+		rf.log = []LogEntry{
+			{},
+		}
+	} else {
+		rf.log = rf.log[rf.logIndexAbs(index):]
+	}
 
 	rf.lastSnapshotIndex = index
 	rf.lastSnapshotTerm = rf.log[rf.logIndexAbs(index)].Term
 	rf.currentSnapshot = snapshot
 
+	rf.log[0].Term = rf.lastSnapshotTerm
 	rf.log[0].Command = nil
 	rf.persist()
 }
@@ -105,7 +112,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.identity = FOLLOWER
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		rf.electionTimer = time.NewTimer(randomElectionTimeout())
+		rf.electionTimer.Reset(randomElectionTimeout())
 	}
 	if args.LastIncludedIndex <= rf.lastSnapshotIndex {
 		DPrintf("Term %03d Peer %03d received outdated snapshot index: %d, my: %d\n", rf.currentTerm, rf.me, args.LastIncludedIndex, rf.lastSnapshotIndex)

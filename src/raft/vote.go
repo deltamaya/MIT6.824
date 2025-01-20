@@ -123,7 +123,7 @@ func (rf *Raft) requestElection() {
 		rf.candidateToLeader()
 		rf.resetSyncTimeTrigger()
 	}
-	rf.electionTimer = time.NewTimer(randomElectionTimeout())
+	rf.electionTimer.Reset(randomElectionTimeout())
 
 }
 
@@ -166,7 +166,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.syncEntriesTimer.Stop()
 			rf.identity = FOLLOWER
 		}
-		rf.electionTimer = time.NewTimer(randomElectionTimeout())
+		rf.electionTimer.Reset(randomElectionTimeout())
 		DPrintf("Term %03d: Peer %03d voted for Peer %03d\n", rf.currentTerm, rf.me, rf.votedFor)
 		return
 	}
