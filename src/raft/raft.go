@@ -37,11 +37,11 @@ const (
 )
 
 const (
-	RPCTimeout        = 30 * time.Millisecond
+	RPCTimeout        = 20 * time.Millisecond
 	HeartbeatInterval = 50 * time.Millisecond
 	ElectionTimeout   = 300 * time.Millisecond
 	ApplyInterval     = 100 * time.Millisecond
-	TickInterval      = 10 * time.Millisecond
+	TickInterval      = 5 * time.Millisecond
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -89,7 +89,7 @@ type Raft struct {
 	matchIndex       []int
 	applyCh          chan ApplyMsg
 	notifyApplyCh    chan struct{}
-	syncEntriesCh    chan struct{}
+	stopCh           chan struct{}
 	appendEntryRetry int
 
 	// represent the absolute index of the begining of the peer's log entries
@@ -218,7 +218,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.currentTerm,
 		Command: command,
 	})
-
+	rf.resetSyncTimeTrigger()
 	return index, term, isLeader
 }
 
@@ -234,6 +234,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.stopCh <- struct{}{}
 }
 
 func (rf *Raft) killed() bool {
@@ -242,23 +243,24 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	for !rf.killed() {
-		rf.mu.Lock()
-		if rf.identity == LEADER {
+	go func() {
+		for {
 			select {
-			case <-rf.syncEntriesTimer.C:
-				rf.resetSyncTimeTrigger()
-			default:
+			case <-rf.notifyApplyCh:
+				rf.applyCommitedLogs()
+			case <-rf.stopCh:
+				return
 			}
 		}
+	}()
+	for !rf.killed() {
+		rf.mu.Lock()
 		// Your code here (3A)
 		select {
-		case <-rf.syncEntriesCh:
+		case <-rf.syncEntriesTimer.C:
 			rf.syncEntries()
 		case <-rf.electionTimer.C:
 			rf.requestElection()
-		case <-rf.notifyApplyCh:
-			rf.applyCommitedLogs()
 		default:
 		}
 		rf.mu.Unlock()
@@ -267,15 +269,18 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) applyCommitedLogs() {
+	rf.mu.Lock()
 	DPrintf("Applying log in Peer %03d, snapshot: %d, lastApplied: %d, commitIndex: %d with log %v\n", rf.me, rf.lastSnapshotIndex, rf.lastApplied, rf.commitIndex, rf.log)
-	msgs := make([]ApplyMsg, 10)
-	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		msg := ApplyMsg{
-			CommandValid: true,
-			Command:      rf.log[rf.logIndexAbs(i)].Command,
-			CommandIndex: i,
+	msgs := make([]ApplyMsg, 0, 20)
+	if !(rf.lastApplied < rf.lastSnapshotIndex || rf.commitIndex <= rf.lastApplied) {
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.logIndexAbs(i)].Command,
+				CommandIndex: i,
+			}
+			msgs = append(msgs, msg)
 		}
-		msgs = append(msgs, msg)
 	}
 	rf.mu.Unlock()
 	for _, msg := range msgs {
@@ -287,8 +292,6 @@ func (rf *Raft) applyCommitedLogs() {
 
 		rf.mu.Unlock()
 	}
-	rf.mu.Lock()
-
 }
 
 type LogEntry struct {
@@ -315,7 +318,7 @@ type AppendEntryReply struct {
 func (rf *Raft) leaderToFollower() {
 	DPrintf("Term %03d: Leader %03d became Follower\n", rf.currentTerm, rf.me)
 	rf.identity = FOLLOWER
-	rf.syncEntriesTimer = nil
+	rf.syncEntriesTimer.Stop()
 	rf.electionTimer = time.NewTimer(randomElectionTimeout())
 }
 func (rf *Raft) candidateToLeader() {
@@ -324,7 +327,7 @@ func (rf *Raft) candidateToLeader() {
 	rf.electionTimer = time.NewTimer(randomElectionTimeout())
 	rf.appendEntryRetry = 0
 
-	rf.resetSyncTime()
+	rf.resetSyncTimeTrigger()
 
 	count := len(rf.peers)
 	rf.nextIndex = make([]int, count)
@@ -364,13 +367,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.electionTimer = time.NewTimer(randomElectionTimeout())
 	rf.identity = FOLLOWER
-	rf.syncEntriesTimer = nil
+	rf.syncEntriesTimer = time.NewTimer(HeartbeatInterval)
+	rf.syncEntriesTimer.Stop()
 	rf.applyCh = applyCh
+	rf.stopCh = make(chan struct{}, 1)
 	rf.log = []LogEntry{
 		{},
 	}
 	rf.notifyApplyCh = make(chan struct{}, 10)
-	rf.syncEntriesCh = make(chan struct{}, 10)
 	rf.currentSnapshot = nil
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

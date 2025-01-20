@@ -78,6 +78,8 @@ func (rf *Raft) requestElection() {
 	defer rf.persist()
 	DPrintf("Term %03d: Candidate %03d requesting election.\n", rf.currentTerm, rf.me)
 
+	rf.mu.Unlock()
+
 	total := len(rf.peers)
 	replies := make([]RequestVoteReply, total)
 
@@ -86,6 +88,8 @@ func (rf *Raft) requestElection() {
 		if idx == rf.me {
 			continue
 		}
+		rf.mu.Lock()
+
 		lastLogIndex := rf.logLengthAbs() - 1
 		args := RequestVoteArgs{
 			CandidateID:  rf.me,
@@ -93,6 +97,8 @@ func (rf *Raft) requestElection() {
 			LastLogIndex: lastLogIndex,
 			LastLogTerm:  rf.log[rf.logIndexAbs(lastLogIndex)].Term,
 		}
+		rf.mu.Unlock()
+
 		go func(idx int) {
 			ok := rf.sendRequestVote(idx, &args, &replies[idx])
 			if ok && replies[idx].VoteGranted {
@@ -103,12 +109,14 @@ func (rf *Raft) requestElection() {
 		}(idx)
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(RPCTimeout)
+	rf.mu.Lock()
 	if rf.killed() {
 		return
 	}
 	mtx.Lock()
 	defer mtx.Unlock()
+
 	DPrintf("Term %03d: Candidate %03d got %03d votes\n", rf.currentTerm, rf.me, voteCount)
 	// vote is greater than half, become leader
 	if rf.isMajority(voteCount) {
@@ -155,7 +163,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
 		if rf.identity == LEADER {
-			rf.syncEntriesTimer = nil
+			rf.syncEntriesTimer.Stop()
 			rf.identity = FOLLOWER
 		}
 		rf.electionTimer = time.NewTimer(randomElectionTimeout())

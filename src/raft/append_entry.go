@@ -86,17 +86,21 @@ func (rf *Raft) syncEntries() {
 					if rf.isMajority(count) {
 						rf.commitIndex = i
 						hasCommit = true
+					} else {
+						break
 					}
 				}
 				if hasCommit {
 					DPrintf("Term %03d Leader %03d update commit index -> %d\n", rf.currentTerm, rf.me, rf.commitIndex)
 					rf.notifyApplyCh <- struct{}{}
+					// notify followers to update commit
+					// rf.resetSyncTimeTrigger()
 				}
 			}
 
 		}(idx)
 	}
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(RPCTimeout)
 
 	rf.mu.Lock()
 
@@ -252,9 +256,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 }
 
 func (rf *Raft) resetSyncTime() {
-	rf.syncEntriesTimer = time.NewTimer(HeartbeatInterval)
+	rf.syncEntriesTimer.Reset(HeartbeatInterval)
 }
 func (rf *Raft) resetSyncTimeTrigger() {
-	rf.syncEntriesCh <- struct{}{}
-	rf.syncEntriesTimer = time.NewTimer(HeartbeatInterval)
+	rf.syncEntriesTimer.Reset(0)
 }

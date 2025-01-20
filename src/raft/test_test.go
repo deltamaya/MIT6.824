@@ -521,6 +521,7 @@ func TestBackup3B(t *testing.T) {
 
 	// submit lots of commands that won't commit
 	for i := 0; i < 50; i++ {
+		DPrintf("Starting %d\n", i)
 		cfg.rafts[leader1].Start(rand.Int())
 	}
 
