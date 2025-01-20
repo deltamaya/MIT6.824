@@ -4,10 +4,15 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+)
+
+const (
+	RequestTimeout = 300 * time.Millisecond
 )
 
 const Debug = true
@@ -45,21 +50,19 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	data          map[string]string
-	responseCache map[int]ResponseCache
-	resultCh      chan Result
+	data           map[string]string
+	responseCache  map[int]ResponseCache
+	resultNotifyCh map[int]chan Result
 }
 
 type Result struct {
-	ClerkID   int
-	RequestID int
-	Value     string
+	clerkID   int
+	requestID int
+	value     string
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
 	op := Op{
 		Name:      "Get",
 		Key:       args.Key,
@@ -67,20 +70,19 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		ClerkID:   args.ClerkID,
 		RequestID: args.RequestID,
 	}
-	idx, _, isleader := kv.rf.Start(op)
+	_, _, isleader := kv.rf.Start(op)
 	if !isleader {
 		DPrintf("Peer %03d is not leader, rejecting request.\n", kv.me)
 		reply.Err = ErrWrongLeader
 		return
 	}
-	go kv.handleGetReply(args, reply)
-
+	err, res := kv.waitCommand(op.ClerkID)
+	reply.Err = err
+	reply.Value = res.value
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
 	op := Op{
 		Name:      "Put",
 		Key:       args.Key,
@@ -88,36 +90,19 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 		ClerkID:   args.ClerkID,
 		RequestID: args.RequestID,
 	}
-	idx, _, isleader := kv.rf.Start(op)
+	_, _, isleader := kv.rf.Start(op)
 	if !isleader {
 		DPrintf("Peer %03d is not leader, rejecting request.\n", kv.me)
 		reply.Err = ErrWrongLeader
 		return
 	}
-	for {
-		msg := <-kv.applyCh
-		DPrintf("Peer %03d got msg %v.\n", kv.me, msg)
-
-		if msg.CommandValid &&
-			idx == msg.CommandIndex &&
-			msg.Command != nil {
-			op = msg.Command.(Op)
-			if op.ClerkID == args.ClerkID &&
-				op.RequestID == args.RequestID {
-				value := args.Value
-				kv.data[args.Key] = value
-				reply.Err = OK
-				DPrintf("Peer %03d replied request.\n", kv.me)
-				break
-			}
-		}
-	}
+	err, _ := kv.waitCommand(op.ClerkID)
+	reply.Err = err
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+
 	op := Op{
 		Name:      "Append",
 		Key:       args.Key,
@@ -125,49 +110,60 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 		ClerkID:   args.ClerkID,
 		RequestID: args.RequestID,
 	}
-	idx, _, isleader := kv.rf.Start(op)
+	_, _, isleader := kv.rf.Start(op)
 	if !isleader {
 		DPrintf("Peer %03d is not leader, rejecting request.\n", kv.me)
 		reply.Err = ErrWrongLeader
 		return
 	}
-	for {
-		msg := <-kv.applyCh
-		DPrintf("Peer %03d got msg %v.\n", kv.me, msg)
+	err, _ := kv.waitCommand(op.ClerkID)
+	reply.Err = err
+}
 
-		if msg.CommandValid &&
-			idx == msg.CommandIndex &&
-			msg.Command != nil {
-			op = msg.Command.(Op)
-			if op.ClerkID == args.ClerkID &&
-				op.RequestID == args.RequestID {
-				oldValue, ok := kv.data[args.Key]
-				if !ok {
-					oldValue = ""
-				}
-				kv.data[args.Key] = oldValue + args.Value
-				reply.Err = OK
-				DPrintf("Peer %03d replied request.\n", kv.me)
-				break
-			}
-		}
+func (kv *KVServer) waitCommand(clerkID int) (Err, Result) {
+	timeout := time.NewTimer(RequestTimeout)
+	defer timeout.Stop()
+	resultCh := make(chan Result, 1)
+
+	kv.mu.Lock()
+	kv.resultNotifyCh[clerkID] = resultCh
+	kv.mu.Unlock()
+
+	select {
+	case <-timeout.C:
+		DPrintf("Server %03d timeout\n", kv.me)
+		kv.removeResultCh(clerkID)
+		return ErrTimeout, Result{}
+	case res := <-resultCh:
+		kv.removeResultCh(clerkID)
+		return OK, res
 	}
 }
 
-func (kv *KVServer) executeCommand(op Op) string {
+func (kv *KVServer) removeResultCh(clerkID int) {
+	kv.mu.Lock()
+	delete(kv.resultNotifyCh, clerkID)
+	kv.mu.Unlock()
+}
+
+func (kv *KVServer) executeCommand(op Op) Result {
+	res := Result{}
+	res.clerkID = op.ClerkID
+	res.requestID = op.RequestID
 	if op.Name == "Get" {
-		return kv.data[op.Key]
+		res.value = kv.data[op.Key]
 	} else if op.Name == "Put" {
 		kv.data[op.Key] = op.Value
-		return ""
+		res.value = ""
 	} else {
 		oldValue, ok := kv.data[op.Key]
 		if !ok {
 			oldValue = ""
 		}
 		kv.data[op.Key] = oldValue + op.Value
-		return ""
+		res.value = ""
 	}
+	return res
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -216,31 +212,27 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.data = make(map[string]string)
 	kv.responseCache = make(map[int]ResponseCache)
+	kv.resultNotifyCh = make(map[int]chan Result)
 
 	// You may need initialization code here.
+	go kv.handleApplyCh()
 	return kv
 }
-
-func (kv *KVServer) handleGetReply(targetIndex int,args *GetArgs, reply *GetReply) {
+func (kv *KVServer) handleApplyCh() {
 	for {
-		msg := <-kv.applyCh
-		DPrintf("Peer %03d got msg %v.\n", kv.me, msg)
-		if msg.CommandValid {
-			if msg.CommandIndex==
-		} else if msg.SnapshotValid {
-
-		}
-		if msg.CommandValid &&
-			idx == msg.CommandIndex &&
-			msg.Command != nil {
-			op = msg.Command.(Op)
-			if op.ClerkID == args.ClerkID &&
-				op.RequestID == args.RequestID {
-				value := kv.data[args.Key]
-				reply.Value = value
-				reply.Err = OK
-				DPrintf("Peer %03d replied request.\n", kv.me)
-				break
+		select {
+		case msg := <-kv.applyCh:
+			if msg.CommandValid {
+				idx := msg.CommandIndex
+				DPrintf("Peer %03d got command %d, %v\n", kv.me, idx, msg.Command)
+				op := msg.Command.(Op)
+				kv.mu.Lock()
+				res := kv.executeCommand(op)
+				ch, ok := kv.resultNotifyCh[op.ClerkID]
+				if ok {
+					ch <- res
+				}
+				kv.mu.Unlock()
 			}
 		}
 	}

@@ -9,6 +9,10 @@ import (
 	"6.5840/labrpc"
 )
 
+const (
+	LeaderElectionTimeout = 10 * time.Millisecond
+)
+
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
@@ -53,30 +57,24 @@ func (ck *Clerk) Get(key string) string {
 		ClerkID:   ck.id,
 		RequestID: ck.requestIndex,
 	}
-	reply := GetReply{}
-outer:
+	value := ""
 	for {
+		reply := GetReply{}
 		DPrintf("Calling Get to peer %03d\n", ck.leaderID)
 		ok := ck.servers[ck.leaderID].Call("KVServer.Get", &args, &reply)
 		if ok && reply.Err == OK {
+			value = reply.Value
 			break
 		}
-		for i, server := range ck.servers {
-			DPrintf("Calling Get to peer %03d\n", i)
-			ok := server.Call("KVServer.Get", &args, &reply)
-			if ok && reply.Err == OK {
-				ck.leaderID = i
-				break outer
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
+		ck.leaderID = (ck.leaderID + 1) % len(ck.servers)
+		time.Sleep(LeaderElectionTimeout)
 	}
 	ck.requestIndex++
-	return reply.Value
+	return value
 }
 
 // shared by Put and Append.
-//
+// 7
 // you can send an RPC with code like this:
 // ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
 //
@@ -93,24 +91,15 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		ClerkID:   ck.id,
 		RequestID: ck.requestIndex,
 	}
-	reply := PutAppendReply{}
-outer:
 	for {
+		reply := PutAppendReply{}
 		DPrintf("Calling %s to peer %03d\n", op, ck.leaderID)
-
 		ok := ck.servers[ck.leaderID].Call("KVServer."+op, &args, &reply)
 		if ok && reply.Err == OK {
 			break
 		}
-		for i, server := range ck.servers {
-			DPrintf("try Calling %s to peer %03d\n", op, i)
-			ok := server.Call("KVServer."+op, &args, &reply)
-			if ok && reply.Err == OK {
-				ck.leaderID = i
-				break outer
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
+		ck.leaderID = (ck.leaderID + 1) % len(ck.servers)
+		time.Sleep(LeaderElectionTimeout)
 	}
 	ck.requestIndex++
 }
