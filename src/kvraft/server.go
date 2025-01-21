@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -15,7 +16,7 @@ const (
 	RequestTimeout = 300 * time.Millisecond
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -49,6 +50,8 @@ type KVServer struct {
 	lastApplied    map[int]int
 	resultNotifyCh map[int]chan Result
 	stopCh         chan struct{}
+
+	persister *raft.Persister
 }
 
 type Result struct {
@@ -179,6 +182,27 @@ func (kv *KVServer) executeCommand(op Op) Result {
 	return res
 }
 
+func (kv *KVServer) getSnapshotData() []byte {
+	writer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(writer)
+	encoder.Encode(kv.data)
+	encoder.Encode(kv.lastApplied)
+	return writer.Bytes()
+}
+
+func (kv *KVServer) applySnapshot(snapshotData []byte) {
+	r := bytes.NewBuffer(snapshotData)
+	decoder := labgob.NewDecoder(r)
+	var data map[string]string
+	var lastApplied map[int]int
+	if decoder.Decode(&data) != nil ||
+		decoder.Decode(&lastApplied) != nil {
+		DPrintf("Unable to decode\n")
+	}
+	kv.data = data
+	kv.lastApplied = lastApplied
+}
+
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
 // code to set rf.dead (without needing a lock),
@@ -229,6 +253,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.resultNotifyCh = make(map[int]chan Result)
 	kv.stopCh = make(chan struct{}, 1)
 
+	kv.persister = persister
+	snapshot := kv.persister.ReadSnapshot()
+	if snapshot != nil && len(snapshot) > 0 {
+		DPrintf("snapshot: %v\n", snapshot)
+		kv.applySnapshot(snapshot)
+	}
+
 	// You may need initialization code here.
 	go kv.handleApplyCh()
 	return kv
@@ -237,8 +268,10 @@ func (kv *KVServer) handleApplyCh() {
 	for {
 		select {
 		case msg := <-kv.applyCh:
-			if msg.CommandValid {
-				// idx := msg.CommandIndex
+			if msg.SnapshotValid {
+				kv.applySnapshot(msg.Snapshot)
+			} else if msg.CommandValid {
+				idx := msg.CommandIndex
 				// DPrintf("Peer %03d got command %d, %v\n", kv.me, idx, msg.Command)
 				op := msg.Command.(Op)
 				kv.mu.Lock()
@@ -246,6 +279,9 @@ func (kv *KVServer) handleApplyCh() {
 				ch, ok := kv.resultNotifyCh[op.RequestID]
 				if ok {
 					ch <- res
+				}
+				if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
+					kv.rf.Snapshot(idx, kv.getSnapshotData())
 				}
 				kv.mu.Unlock()
 			}
