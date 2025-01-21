@@ -37,11 +37,11 @@ const (
 )
 
 const (
-	RPCTimeout        = 20 * time.Millisecond
-	HeartbeatInterval = 50 * time.Millisecond
+	RPCTimeout        = 100 * time.Millisecond
+	HeartbeatInterval = 100 * time.Millisecond
 	ElectionTimeout   = 300 * time.Millisecond
 	ApplyInterval     = 100 * time.Millisecond
-	TickInterval      = 5 * time.Millisecond
+	TickInterval      = 10 * time.Millisecond
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -77,20 +77,20 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	currentTerm      int
-	votedFor         int
-	electionTimer    *time.Timer
-	syncEntriesTimer *time.Timer
-	identity         int
-	log              []LogEntry
-	commitIndex      int
-	lastApplied      int
-	nextIndex        []int
-	matchIndex       []int
-	applyCh          chan ApplyMsg
-	notifyApplyCh    chan struct{}
-	stopCh           chan struct{}
-	appendEntryRetry int
+	currentTerm         int
+	votedFor            int
+	electionTimer       *time.Timer
+	appendEntriesTimers []*time.Timer
+	applyTimer          *time.Timer
+	identity            int
+	logs                []LogEntry
+	commitIndex         int
+	lastApplied         int
+	nextIndex           []int
+	matchIndex          []int
+	applyCh             chan ApplyMsg
+	notifyApplyCh       chan struct{}
+	stopCh              chan struct{}
 
 	// represent the absolute index of the begining of the peer's log entries
 	lastSnapshotIndex int
@@ -103,12 +103,8 @@ type Raft struct {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	var term int
-	var isleader bool
 	// Your code here (3A).
-	term = rf.currentTerm
-	isleader = rf.identity == LEADER
-	return term, isleader
+	return rf.currentTerm, rf.identity == LEADER
 }
 
 // save Raft's persistent state to stable storage,
@@ -147,7 +143,7 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.votedFor = votedFor
 	rf.lastSnapshotIndex = lastSnapshotIndex
 	rf.lastSnapshotTerm = lastSnapshotTerm
-	rf.log = log
+	rf.logs = log
 
 	rf.currentSnapshot = rf.getSnapshotData()
 
@@ -162,7 +158,7 @@ func (rf *Raft) getStateData() []byte {
 	e.Encode(rf.votedFor)
 	e.Encode(rf.lastSnapshotIndex)
 	e.Encode(rf.lastSnapshotTerm)
-	e.Encode(rf.log)
+	e.Encode(rf.logs)
 	state := w.Bytes()
 	return state
 }
@@ -214,11 +210,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	index = rf.logLengthAbs()
-	rf.log = append(rf.log, LogEntry{
+	rf.logs = append(rf.logs, LogEntry{
 		Term:    rf.currentTerm,
 		Command: command,
 	})
-	rf.resetSyncTimeTrigger()
+	rf.resetAllAppendEntryTimerTrigger()
 	return index, term, isLeader
 }
 
@@ -246,6 +242,9 @@ func (rf *Raft) ticker() {
 	go func() {
 		for {
 			select {
+			case <-rf.applyTimer.C:
+				rf.notifyApplyCh <- struct{}{}
+				rf.resetApplyTimer()
 			case <-rf.notifyApplyCh:
 				rf.applyCommitedLogs()
 			case <-rf.stopCh:
@@ -253,30 +252,47 @@ func (rf *Raft) ticker() {
 			}
 		}
 	}()
-	for !rf.killed() {
-		rf.mu.Lock()
-		// Your code here (3A)
-		select {
-		case <-rf.syncEntriesTimer.C:
-			rf.syncEntries()
-		case <-rf.electionTimer.C:
-			rf.requestElection()
-		default:
+	go func() {
+		for !rf.killed() {
+			select {
+			case <-rf.electionTimer.C:
+				rf.requestElection()
+			case <-rf.stopCh:
+				return
+			}
 		}
-		rf.mu.Unlock()
-		time.Sleep(TickInterval)
+	}()
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(idx int) {
+			for !rf.killed() {
+				select {
+				case <-rf.stopCh:
+					return
+				case <-rf.appendEntriesTimers[idx].C:
+					rf.sendAppendEntriesToPeer(idx)
+				}
+			}
+		}(i)
 	}
+}
+
+func (rf *Raft) resetApplyTimer() {
+	rf.applyTimer.Stop()
+	rf.applyTimer.Reset(ApplyInterval)
 }
 
 func (rf *Raft) applyCommitedLogs() {
 	rf.mu.Lock()
-	DPrintf("Applying log in Peer %03d, snapshot: %d, lastApplied: %d, commitIndex: %d with log %v\n", rf.me, rf.lastSnapshotIndex, rf.lastApplied, rf.commitIndex, rf.log)
+	// DPrintf("Applying log in Peer %03d, snapshot: %d, lastApplied: %d, commitIndex: %d with log %v\n", rf.me, rf.lastSnapshotIndex, rf.lastApplied, rf.commitIndex, rf.logs)
 	msgs := make([]ApplyMsg, 0, 20)
 	if !(rf.lastApplied < rf.lastSnapshotIndex || rf.commitIndex <= rf.lastApplied) {
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			msg := ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[rf.logIndexAbs(i)].Command,
+				Command:      rf.logs[rf.logIndexAbs(i)].Command,
 				CommandIndex: i,
 			}
 			msgs = append(msgs, msg)
@@ -315,33 +331,6 @@ type AppendEntryReply struct {
 	NextLogIndex int
 }
 
-func (rf *Raft) leaderToFollower() {
-	DPrintf("Term %03d: Leader %03d became Follower\n", rf.currentTerm, rf.me)
-	rf.identity = FOLLOWER
-	rf.syncEntriesTimer.Stop()
-	rf.electionTimer.Reset(randomElectionTimeout())
-}
-func (rf *Raft) candidateToLeader() {
-	DPrintf("Term %03d: Candidate %03d became Leader\n", rf.currentTerm, rf.me)
-	rf.identity = LEADER
-	rf.electionTimer.Reset(randomElectionTimeout())
-	rf.appendEntryRetry = 0
-
-	rf.resetSyncTimeTrigger()
-
-	count := len(rf.peers)
-	rf.nextIndex = make([]int, count)
-	lastLogIndex := rf.logLengthAbs() - 1
-	for i := 0; i < count; i++ {
-		rf.nextIndex[i] = lastLogIndex + 1
-	}
-	rf.matchIndex = make([]int, count)
-	for i := 0; i < count; i++ {
-		rf.matchIndex[i] = 0
-	}
-
-}
-
 func (rf *Raft) isMajority(n int) bool {
 	return n >= ((len(rf.peers) + 1) / 2)
 }
@@ -365,22 +354,34 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (3A, 3B, 3C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.electionTimer = time.NewTimer(randomElectionTimeout())
 	rf.identity = FOLLOWER
-	rf.syncEntriesTimer = time.NewTimer(HeartbeatInterval)
-	rf.syncEntriesTimer.Stop()
+
 	rf.applyCh = applyCh
 	rf.stopCh = make(chan struct{}, 1)
-	rf.log = []LogEntry{
+	rf.logs = []LogEntry{
 		{},
 	}
-	rf.notifyApplyCh = make(chan struct{}, 10)
+	rf.notifyApplyCh = make(chan struct{}, 99)
 	rf.currentSnapshot = nil
+
+	rf.matchIndex = make([]int, len(peers))
+	rf.nextIndex = make([]int, len(peers))
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
 
+	rf.electionTimer = time.NewTimer(randomElectionTimeout())
+	rf.applyTimer = time.NewTimer(ApplyInterval)
+	rf.appendEntriesTimers = make([]*time.Timer, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		rf.appendEntriesTimers[i] = time.NewTimer(HeartbeatInterval)
+	}
+
+	rf.ticker()
 	return rf
+}
+
+func (rf *Raft) lastLogTermIndex() (int, int) {
+	return rf.logs[len(rf.logs)-1].Term, rf.lastSnapshotIndex + len(rf.logs) - 1
 }

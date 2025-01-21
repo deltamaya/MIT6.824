@@ -10,16 +10,15 @@ import (
 )
 
 const (
-	LeaderElectionTimeout = 10 * time.Millisecond
+	RPCTimeout = 10 * time.Millisecond
 )
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	mu           sync.Mutex
-	id           int
-	requestIndex int
-	leaderID     int
+	mu        sync.Mutex
+	id        int
+	curLeader int
 }
 
 func nrand() int64 {
@@ -55,21 +54,20 @@ func (ck *Clerk) Get(key string) string {
 	args := GetArgs{
 		Key:       key,
 		ClerkID:   ck.id,
-		RequestID: ck.requestIndex,
+		RequestID: int(nrand()),
 	}
 	value := ""
 	for {
 		reply := GetReply{}
-		DPrintf("Calling Get to peer %03d\n", ck.leaderID)
-		ok := ck.servers[ck.leaderID].Call("KVServer.Get", &args, &reply)
+		DPrintf("Calling Get to server %03d\n", ck.curLeader)
+		ok := ck.servers[ck.curLeader].Call("KVServer.Get", &args, &reply)
 		if ok && reply.Err == OK {
 			value = reply.Value
 			break
 		}
-		ck.leaderID = (ck.leaderID + 1) % len(ck.servers)
-		time.Sleep(LeaderElectionTimeout)
+		ck.curLeader = (ck.curLeader + 1) % len(ck.servers)
+		time.Sleep(RPCTimeout)
 	}
-	ck.requestIndex++
 	return value
 }
 
@@ -89,19 +87,18 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Key:       key,
 		Value:     value,
 		ClerkID:   ck.id,
-		RequestID: ck.requestIndex,
+		RequestID: int(nrand()),
 	}
 	for {
 		reply := PutAppendReply{}
-		DPrintf("Calling %s to peer %03d\n", op, ck.leaderID)
-		ok := ck.servers[ck.leaderID].Call("KVServer."+op, &args, &reply)
+		DPrintf("Calling %s to server %03d\n", op, ck.curLeader)
+		ok := ck.servers[ck.curLeader].Call("KVServer."+op, &args, &reply)
 		if ok && reply.Err == OK {
 			break
 		}
-		ck.leaderID = (ck.leaderID + 1) % len(ck.servers)
-		time.Sleep(LeaderElectionTimeout)
+		ck.curLeader = (ck.curLeader + 1) % len(ck.servers)
+		time.Sleep(RPCTimeout)
 	}
-	ck.requestIndex++
 }
 
 func (ck *Clerk) Put(key string, value string) {

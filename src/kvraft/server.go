@@ -35,11 +35,6 @@ type Op struct {
 	RequestID int
 }
 
-type ResponseCache struct {
-	ClerkID   int
-	RequestID int
-}
-
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -51,8 +46,9 @@ type KVServer struct {
 
 	// Your definitions here.
 	data           map[string]string
-	responseCache  map[int]ResponseCache
+	lastApplied    map[int]int
 	resultNotifyCh map[int]chan Result
+	stopCh         chan struct{}
 }
 
 type Result struct {
@@ -72,13 +68,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	_, _, isleader := kv.rf.Start(op)
 	if !isleader {
-		DPrintf("Peer %03d is not leader, rejecting request.\n", kv.me)
 		reply.Err = ErrWrongLeader
 		return
 	}
-	err, res := kv.waitCommand(op.ClerkID)
+	err, res := kv.waitCommand(op.RequestID)
 	reply.Err = err
 	reply.Value = res.value
+	DPrintf("Leader %03d replied GET args: %v, rep: %v.\n", kv.me, args, reply)
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
@@ -92,12 +88,13 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	_, _, isleader := kv.rf.Start(op)
 	if !isleader {
-		DPrintf("Peer %03d is not leader, rejecting request.\n", kv.me)
 		reply.Err = ErrWrongLeader
 		return
 	}
-	err, _ := kv.waitCommand(op.ClerkID)
+	err, _ := kv.waitCommand(op.RequestID)
 	reply.Err = err
+	DPrintf("Leader %03d replied PUT args: %v, rep: %v.\n", kv.me, args, reply)
+
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
@@ -116,33 +113,35 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	err, _ := kv.waitCommand(op.ClerkID)
+	err, _ := kv.waitCommand(op.RequestID)
 	reply.Err = err
+	DPrintf("Leader %03d replied APPEND args: %v, rep: %v.\n", kv.me, args, reply)
+
 }
 
-func (kv *KVServer) waitCommand(clerkID int) (Err, Result) {
+func (kv *KVServer) waitCommand(requestID int) (Err, Result) {
 	timeout := time.NewTimer(RequestTimeout)
 	defer timeout.Stop()
 	resultCh := make(chan Result, 1)
 
 	kv.mu.Lock()
-	kv.resultNotifyCh[clerkID] = resultCh
+	kv.resultNotifyCh[requestID] = resultCh
 	kv.mu.Unlock()
 
 	select {
 	case <-timeout.C:
 		DPrintf("Server %03d timeout\n", kv.me)
-		kv.removeResultCh(clerkID)
-		return ErrTimeout, Result{}
+		kv.removeResultCh(requestID)
+		return ErrTimeout, Result{requestID: -1, clerkID: -1, value: ""}
 	case res := <-resultCh:
-		kv.removeResultCh(clerkID)
+		kv.removeResultCh(requestID)
 		return OK, res
 	}
 }
 
-func (kv *KVServer) removeResultCh(clerkID int) {
+func (kv *KVServer) removeResultCh(requestID int) {
 	kv.mu.Lock()
-	delete(kv.resultNotifyCh, clerkID)
+	delete(kv.resultNotifyCh, requestID)
 	kv.mu.Unlock()
 }
 
@@ -150,18 +149,24 @@ func (kv *KVServer) executeCommand(op Op) Result {
 	res := Result{}
 	res.clerkID = op.ClerkID
 	res.requestID = op.RequestID
-	if op.Name == "Get" {
-		res.value = kv.data[op.Key]
-	} else if op.Name == "Put" {
-		kv.data[op.Key] = op.Value
-		res.value = ""
-	} else {
-		oldValue, ok := kv.data[op.Key]
-		if !ok {
-			oldValue = ""
+	res.value = ""
+	requestID, ok := kv.lastApplied[op.ClerkID]
+	if !ok || op.RequestID != requestID {
+		kv.lastApplied[op.ClerkID] = op.RequestID
+		if op.Name == "Get" {
+			res.value = kv.data[op.Key]
+		} else if op.Name == "Put" {
+			kv.data[op.Key] = op.Value
+			res.value = ""
+		} else {
+			oldValue, ok := kv.data[op.Key]
+			if !ok {
+				oldValue = ""
+			}
+			kv.data[op.Key] = oldValue + op.Value
+			res.value = ""
 		}
-		kv.data[op.Key] = oldValue + op.Value
-		res.value = ""
+		DPrintf("Peer %03d data: %v\n", kv.me, kv.data)
 	}
 	return res
 }
@@ -178,6 +183,7 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+	kv.stopCh <- struct{}{}
 }
 
 func (kv *KVServer) killed() bool {
@@ -211,8 +217,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.data = make(map[string]string)
-	kv.responseCache = make(map[int]ResponseCache)
+	kv.lastApplied = make(map[int]int)
 	kv.resultNotifyCh = make(map[int]chan Result)
+	kv.stopCh = make(chan struct{}, 1)
 
 	// You may need initialization code here.
 	go kv.handleApplyCh()
@@ -223,17 +230,20 @@ func (kv *KVServer) handleApplyCh() {
 		select {
 		case msg := <-kv.applyCh:
 			if msg.CommandValid {
-				idx := msg.CommandIndex
-				DPrintf("Peer %03d got command %d, %v\n", kv.me, idx, msg.Command)
+				// idx := msg.CommandIndex
+				// DPrintf("Peer %03d got command %d, %v\n", kv.me, idx, msg.Command)
 				op := msg.Command.(Op)
 				kv.mu.Lock()
 				res := kv.executeCommand(op)
-				ch, ok := kv.resultNotifyCh[op.ClerkID]
+				ch, ok := kv.resultNotifyCh[op.RequestID]
 				if ok {
 					ch <- res
 				}
 				kv.mu.Unlock()
 			}
+		case <-kv.stopCh:
+			return
 		}
+
 	}
 }

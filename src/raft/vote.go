@@ -2,7 +2,6 @@ package raft
 
 import (
 	"math/rand"
-	"sync"
 	"time"
 )
 
@@ -33,10 +32,10 @@ import (
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, ret chan<- *RequestVoteReply) {
 	timeout := time.NewTimer(RPCTimeout)
 	defer timeout.Stop()
-	ret := make(chan struct{}, 1)
+	notify := make(chan *RequestVoteReply, 1)
 	stopCh := make(chan struct{}, 1)
 	go func() {
 		for i := 0; i < 10; i++ {
@@ -50,81 +49,101 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 			}
 			ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 			if ok {
-				ret <- struct{}{}
+				notify <- reply
 				break
 			}
 		}
 	}()
 	select {
-	case <-ret:
-		return true
+	case r := <-notify:
+		ret <- r
 	case <-timeout.C:
 		DPrintf("Term %03d Peer %03d Request Vote to %03d timeout\n", args.Term, rf.me, server)
 		stopCh <- struct{}{}
-		return false
+		ret <- &RequestVoteReply{}
 	}
 }
 
 func (rf *Raft) requestElection() {
+	rf.mu.Lock()
+	rf.resetElectionTimer()
 	if rf.killed() {
+		rf.mu.Unlock()
 		return
 	}
-	// vote for myself by default
-	voteCount := 1
-	rf.votedFor = rf.me
-	rf.identity = CANDIDATE
-	rf.currentTerm++
-	rf.persist()
-	defer rf.persist()
-	DPrintf("Term %03d: Candidate %03d requesting election.\n", rf.currentTerm, rf.me)
+	if rf.identity == LEADER {
+		rf.mu.Unlock()
+		return
+	}
 
+	// vote for myself by default
+	rf.changeIdentity(CANDIDATE)
+	rf.persist()
+	DPrintf("Term %03d: Candidate %03d requesting election.\n", rf.currentTerm, rf.me)
+	lastLogTerm, lastLogIndex := rf.lastLogTermIndex()
+	args := RequestVoteArgs{
+		CandidateID:  rf.me,
+		Term:         rf.currentTerm,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	}
 	rf.mu.Unlock()
 
-	total := len(rf.peers)
-	replies := make([]RequestVoteReply, total)
+	voteCh := make(chan bool, len(rf.peers)-1)
 
-	mtx := sync.Mutex{}
 	for idx := range rf.peers {
 		if idx == rf.me {
 			continue
 		}
-		rf.mu.Lock()
-
-		lastLogIndex := rf.logLengthAbs() - 1
-		args := RequestVoteArgs{
-			CandidateID:  rf.me,
-			Term:         rf.currentTerm,
-			LastLogIndex: lastLogIndex,
-			LastLogTerm:  rf.log[rf.logIndexAbs(lastLogIndex)].Term,
-		}
-		rf.mu.Unlock()
 
 		go func(idx int) {
-			ok := rf.sendRequestVote(idx, &args, &replies[idx])
-			if ok && replies[idx].VoteGranted {
-				mtx.Lock()
-				defer mtx.Unlock()
-				voteCount++
+			ret := make(chan *RequestVoteReply, 1)
+			reply := &RequestVoteReply{}
+			rf.sendRequestVote(idx, &args, reply, ret)
+			reply = <-ret
+			voteCh <- reply.VoteGranted
+			if reply.Term > args.Term {
+				rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.changeIdentity(FOLLOWER)
+					rf.votedFor = -1
+					rf.resetElectionTimer()
+					rf.persist()
+				}
+				rf.mu.Unlock()
 			}
 		}(idx)
 	}
 
-	time.Sleep(RPCTimeout)
-	rf.mu.Lock()
-	if rf.killed() {
-		return
-	}
-	mtx.Lock()
-	defer mtx.Unlock()
+	resCount := 1
+	grantCount := 1
+	total := len(rf.peers)
+	for {
+		granted := <-voteCh
+		resCount++
+		if granted {
+			grantCount++
+		}
+		DPrintf("vote: %v, allCount: %v, resCount: %v, grantedCount: %v", granted, total, resCount, grantCount)
 
-	DPrintf("Term %03d: Candidate %03d got %03d votes\n", rf.currentTerm, rf.me, voteCount)
-	// vote is greater than half, become leader
-	if rf.isMajority(voteCount) {
-		rf.candidateToLeader()
-		rf.resetSyncTimeTrigger()
+		if rf.isMajority(grantCount) {
+			rf.mu.Lock()
+			DPrintf("before try change to leader,count:%d, args:%+v, currentTerm: %v, argsTerm: %v", grantCount, args, rf.currentTerm, args.Term)
+			if rf.identity == CANDIDATE && rf.currentTerm == args.Term {
+				rf.changeIdentity(LEADER)
+			}
+			if rf.identity == LEADER {
+				rf.resetAllAppendEntryTimerTrigger()
+			}
+			rf.persist()
+			rf.mu.Unlock()
+			return
+		}
+		if resCount == total || rf.isMajority(resCount-grantCount) {
+			return
+		}
 	}
-	rf.electionTimer.Reset(randomElectionTimeout())
-
 }
 
 // example RequestVote RPC handler.
@@ -138,9 +157,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	rf.persist()
 	defer rf.persist()
+	reply.Term = rf.currentTerm
+
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
-		reply.Term = rf.currentTerm
 		DPrintf("Term %03d: Peer %03d against Peer %03d, low candidate term %03d\n", rf.currentTerm, rf.me, args.CandidateID, args.Term)
 		return
 	}
@@ -150,7 +170,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	// args.Term == rf.currentTerm
 	lastLogIndex := rf.logLengthAbs() - 1
-	lastLogTerm := rf.log[rf.logIndexAbs(lastLogIndex)].Term
+	lastLogTerm := rf.logs[rf.logIndexAbs(lastLogIndex)].Term
 	if lastLogTerm > args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
 		reply.VoteGranted = false
 		DPrintf("Term %03d: Peer %03d against Peer %03d, outdated log %03d, at term %03d\n", rf.currentTerm, rf.me, args.CandidateID, args.LastLogIndex, args.LastLogTerm)
@@ -162,16 +182,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateID {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
+		rf.resetElectionTimer()
 		if rf.identity == LEADER {
-			rf.syncEntriesTimer.Stop()
-			rf.identity = FOLLOWER
+			rf.changeIdentity(FOLLOWER)
 		}
-		rf.electionTimer.Reset(randomElectionTimeout())
 		DPrintf("Term %03d: Peer %03d voted for Peer %03d\n", rf.currentTerm, rf.me, rf.votedFor)
 		return
 	}
 	reply.VoteGranted = false
-	reply.Term = rf.currentTerm
 	DPrintf("Term %03d: Peer %03d against Peer %03d, already voted for %03d\n", rf.currentTerm, rf.me, args.CandidateID, rf.votedFor)
 
 }
@@ -179,4 +197,30 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func randomElectionTimeout() time.Duration {
 	amount := (rand.Int63() % 300) + 300
 	return time.Duration(amount) * time.Millisecond
+}
+
+func (rf *Raft) resetElectionTimer() {
+	rf.electionTimer.Stop()
+	rf.electionTimer.Reset(randomElectionTimeout())
+}
+
+func (rf *Raft) changeIdentity(ident int) {
+	rf.identity = ident
+	switch ident {
+	case FOLLOWER:
+	case CANDIDATE:
+		rf.currentTerm++
+		rf.votedFor = rf.me
+		rf.resetElectionTimer()
+	case LEADER:
+		_, lastLogIndex := rf.lastLogTermIndex()
+		for i := 0; i < len(rf.peers); i++ {
+			rf.nextIndex[i] = lastLogIndex + 1
+			rf.matchIndex[i] = lastLogIndex
+		}
+		rf.resetElectionTimer()
+	default:
+		DPrintf("Invalid identity: %d\n", ident)
+	}
+
 }
