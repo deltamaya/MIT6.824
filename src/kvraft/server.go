@@ -15,7 +15,7 @@ const (
 	RequestTimeout = 300 * time.Millisecond
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -55,6 +55,7 @@ type Result struct {
 	clerkID   int
 	requestID int
 	value     string
+	err       Err
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -71,8 +72,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	err, res := kv.waitCommand(op.RequestID)
-	reply.Err = err
+	res := kv.waitCommand(op.RequestID)
+	reply.Err = res.err
 	reply.Value = res.value
 	DPrintf("Leader %03d replied GET args: %v, rep: %v.\n", kv.me, args, reply)
 }
@@ -91,8 +92,8 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	err, _ := kv.waitCommand(op.RequestID)
-	reply.Err = err
+	res := kv.waitCommand(op.RequestID)
+	reply.Err = res.err
 	DPrintf("Leader %03d replied PUT args: %v, rep: %v.\n", kv.me, args, reply)
 
 }
@@ -113,13 +114,13 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	err, _ := kv.waitCommand(op.RequestID)
-	reply.Err = err
+	res := kv.waitCommand(op.RequestID)
+	reply.Err = res.err
 	DPrintf("Leader %03d replied APPEND args: %v, rep: %v.\n", kv.me, args, reply)
 
 }
 
-func (kv *KVServer) waitCommand(requestID int) (Err, Result) {
+func (kv *KVServer) waitCommand(requestID int) Result {
 	timeout := time.NewTimer(RequestTimeout)
 	defer timeout.Stop()
 	resultCh := make(chan Result, 1)
@@ -132,10 +133,11 @@ func (kv *KVServer) waitCommand(requestID int) (Err, Result) {
 	case <-timeout.C:
 		DPrintf("Server %03d timeout\n", kv.me)
 		kv.removeResultCh(requestID)
-		return ErrTimeout, Result{requestID: -1, clerkID: -1, value: ""}
+		return Result{requestID: -1, clerkID: -1, value: "", err: ErrTimeout}
 	case res := <-resultCh:
 		kv.removeResultCh(requestID)
-		return OK, res
+		res.err = OK
+		return res
 	}
 }
 
@@ -150,23 +152,29 @@ func (kv *KVServer) executeCommand(op Op) Result {
 	res.clerkID = op.ClerkID
 	res.requestID = op.RequestID
 	res.value = ""
-	requestID, ok := kv.lastApplied[op.ClerkID]
-	if !ok || op.RequestID != requestID {
-		kv.lastApplied[op.ClerkID] = op.RequestID
-		if op.Name == "Get" {
-			res.value = kv.data[op.Key]
-		} else if op.Name == "Put" {
-			kv.data[op.Key] = op.Value
-			res.value = ""
+	if op.Name == "Get" {
+		value, ok := kv.data[op.Key]
+		if !ok {
+			res.err = ErrNoKey
 		} else {
-			oldValue, ok := kv.data[op.Key]
-			if !ok {
-				oldValue = ""
-			}
-			kv.data[op.Key] = oldValue + op.Value
-			res.value = ""
+			res.value = value
 		}
-		DPrintf("Peer %03d data: %v\n", kv.me, kv.data)
+	} else {
+		requestID, ok := kv.lastApplied[op.ClerkID]
+		if !ok || requestID != op.RequestID {
+			if op.Name == "Put" {
+				kv.data[op.Key] = op.Value
+				res.value = ""
+			} else {
+				oldValue, ok := kv.data[op.Key]
+				if !ok {
+					oldValue = ""
+				}
+				kv.data[op.Key] = oldValue + op.Value
+				res.value = ""
+			}
+			kv.lastApplied[op.ClerkID] = op.RequestID
+		}
 	}
 	return res
 }
